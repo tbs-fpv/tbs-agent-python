@@ -18,6 +18,7 @@ class CRSF:
 
     SYNC = 0xc8
 
+    # CRSF Device Addresses
     BROADCAST_ADDR = 0x00
     CLOUD_ADDR = 0x0E       # MQTT server
     WIFI_ADDR = 0x12
@@ -26,6 +27,7 @@ class CRSF:
     RX_ADDR = 0xEC
     TX_ADDR = 0xEE
 
+    # CRSF Frame Types
     MSG_TYPE_GPS = 0x02
     MSG_TYPE_GPST = 0x03
     MSG_TYPE_BATT = 0x08
@@ -41,6 +43,7 @@ class CRSF:
     MSG_TYPE_REMOTE = 0x3A              # Remote-related frames
     MSG_TYPE_MAVLINK_ENV = 0xAA
 
+    # CRSF menu parameter types
     PARAM_TYPE_UINT8 = 0
     PARAM_TYPE_INT8 = 1
     PARAM_TYPE_UINT16 = 2
@@ -55,6 +58,7 @@ class CRSF:
     PARAM_TYPE_COMMAND = 13
     PARAM_TYPE_OUT_OF_RANGE = 127
 
+    # CRSF frame structure (field offsets)
     OFFSET_LENGTH = 1
     OFFSET_MSG_TYPE = 2
 
