@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 
 '''
-CRSF via TCP client in Python.
+CRSF client in Python. Work via TCP or UART connections.
 Can be used to connect to WiFi module on Crossfire.
 It can sniff broadcast frames, receive paramters, etc.
 '''
 
-import socket, sys, time, functools
+import sys, time, functools
+import serial, socket, queue, threading
+
+TCP_CONNECTION = False
 
 TCP_HOST = '192.168.4.1'
 TCP_PORT = 60950                # this TCP port is used by Fusion
+
+SERIAL_PORT = '/dev/tty.usbserial-AQ00MH7Z'
+SERIAL_BAUD = 416666
 # TODO: can also use WebSocket if Fusion is needed simultaneously
 
-TICK_SPEED = 20      # Ticks per microsecond
+TICK_SPEED = 20      # Ticks per microsecond (for LOG frames)
 
 class CRSF:
 
@@ -31,6 +37,10 @@ class CRSF:
     MSG_TYPE_GPS = 0x02
     MSG_TYPE_GPST = 0x03
     MSG_TYPE_BATT = 0x08
+    MSG_TYPE_VTX_TEL = 0x10
+    MSG_TYPE_LINK_STATS = 0x14
+    MSG_TYPE_PPM = 0x16                 # channel values
+    MSG_TYPE_PPM3 = 0x17                # CRSF V3 (packed channel values)
     MSG_TYPE_ATTD = 0x1E
     MSG_TYPE_MADD = 0x1F
     MSG_TYPE_PING = 0x28
@@ -169,7 +179,10 @@ class crsf_parser:
                     else:
                         sys.stderr.write("crc mismatch; byte discarded\n")
                         self.data = self.data[1:]
-
+                else:
+                    break
+            else:
+                break
 
 def log_data(header, data):
     print(str(header) + ':', ''.join(map(lambda x: " %02x" % x, data)))
@@ -198,6 +211,15 @@ def msg_decode(data):
         msg = (bytes(data[:i]).decode(), i+1)
     return msg
 
+bin_byte = lambda x: '{:08b}'.format(x)
+ticks_to_us = lambda x: (x - 992)*5//8 + 1500
+
+def ppm_channels_decode(data):
+    data = ''.join(map(bin_byte, reversed(data)))
+    assert(len(data) % 11 == 0)
+    ticks = [int(data[x:x+11], 2) for x in range(len(data)-11, 0, -11)]
+    return list(map(ticks_to_us, ticks))
+
 def crsf_log_frame(header, frame):
     '''Print CRSF frame in a partially parsed way'''
     s = str(header) + ': '
@@ -213,7 +235,10 @@ def crsf_log_frame(header, frame):
     s += ' '.join(map(lambda x: "%02x" % x, data[i:]))
 
     # Parse certain kinds of frames
-    if frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
+    if frame.type == CRSF.MSG_TYPE_PPM:
+        channels = ppm_channels_decode(frame.payload)
+        s += '\n  CH1..16: ' + ', '.join(map(str, channels))
+    elif frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
         delim = frame.payload.index(0x00)
         device_name, tail = frame.payload[:delim], frame.payload[delim+5:]
         device_name = bytes(device_name).decode()
@@ -249,38 +274,117 @@ def create_frame(data):
     frame.append(calc_crc8(frame[2:]))
     return crsf_frame(frame)
 
+class CRSFConnection:
+    def read_crsf(self):
+        pass 
+    def write_crsf(self, frame):
+        pass
+
+class TCPConnection(CRSFConnection):
+    '''Class for exchanging CRSF over TCP'''
+
+    TIMEOUT_MS = 1000
+
+    def __init__(self):
+        self.parser = crsf_parser()
+        self.frames = []                # incoming frames that were already parsed
+
+        # Connect via TCP socket
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.settimeout(TCPConnection.TIMEOUT_MS)
+        self.socket.connect((TCP_HOST, TCP_PORT))
+
+    def read_crsf(self):
+        # Receive data from serial
+        data = None
+        try:
+            data = self.socket.recv(2048)
+        except socket.timeout:
+            sys.stderr.write('Timeout\n')
+        except KeyboardInterrupt:
+            print('KeyboardInterrup: Quit')
+            sys.exit(0)
+        except Exception as e:
+            sys.stderr.write('ERROR: TCP disconnected\n')
+            del self.socket
+            raise(e)
+
+        # TODO: move to super
+        # Parse data
+        if data and len(data):
+            for frame in self.parser.digest(data):
+                self.frames.append(frame)
+
+        # Return next frame
+        return self.frames.pop(0) if self.frames else None
+
+    def write_crsf(self, frame):
+        self.socket.send(frame.bytes)
+
+class SerialConnection(CRSFConnection):
+    '''Class for exchanging CRSF over UART'''
+
+    def __init__(self):
+        self.parser = crsf_parser()
+        self.serial = serial.Serial(SERIAL_PORT, baudrate=SERIAL_BAUD)
+        self.in_queue = queue.Queue()
+
+        # Receiving thread
+        self.thread = threading.Thread(target=self.read_thread)
+        self.thread.setDaemon(1)
+        self.alive = threading.Event()
+        self.alive.set()
+        self.thread.start()
+
+    def read_thread(self):
+        '''Separate thread for receiving frames asynchronously'''
+        while self.alive.isSet():
+            waiting = self.serial.in_waiting
+            data = self.serial.read(waiting if waiting else 1)
+            if data and len(data):
+                for frame in self.parser.digest(data):
+                    self.in_queue.put(frame, block=False)
+            time.sleep(0.001)
+        print('Exit')
+
+    def read_crsf(self):
+        try:
+            frame = self.in_queue.get(block=False)
+        except queue.Empty:
+            frame = None
+        return frame
+
+    def write_crsf(self, frame):
+        pass
+        #self.serial.write(frame.bytes)
+
 if __name__ == '__main__':
 
     print('Press Ctrl+C to exit')
-    crsf = crsf_parser()
     last_ping = last_read = 0
+
+    # Outer loop to reconnect on disconnect
     while True:
     
-        # Connect via TCP socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1000)
-        s.connect((TCP_HOST, TCP_PORT))
+        if TCP_CONNECTION:
+            print('Connecting with TCP...')
+            conn = TCPConnection()
+        else:
+            print('Connecting with UART...')
+            conn = SerialConnection()
     
         # Update state machine
     
         while True:
-            # Receive data
             try:
-                data = s.recv(2048)
-            except socket.timeout:
-                sys.stderr.write('Timeout\n')
-            except KeyboardInterrupt:
-                print('KeyboardInterrupt')
-                sys.exit(1)
-            except:
-                sys.stderr.write('Disconnect\n')
-                del s
+                frame = conn.read_crsf()
+            except Exception as e:
+                print("err", e)
                 break
         
             # Display data
-            if data and len(data):
-                for frame in crsf.digest(data):
-                    crsf_log_frame('Received', frame)
+            if frame:
+                crsf_log_frame('Received', frame)
         
             # Send ping frame (need to send something periodically so that connection is not reset)
             if time.time() - last_ping > 10:
@@ -289,7 +393,7 @@ if __name__ == '__main__':
                 # Send ping frame
                 frame = create_frame([CRSF.SYNC, 0, CRSF.MSG_TYPE_PING, CRSF.BROADCAST_ADDR, CRSF.CLOUD_ADDR])
                 crsf_log_frame('Sending ping', frame)
-                s.send(frame.bytes)
+                conn.write_crsf(frame)
     
                 #frame = create_frame([CRSF.SYNC, 0, CRSF.MSG_TYPE_PARAM_READ, CRSF.TX_ADDR, CRSF.CLOUD_ADDR, 1, 0])
                 #s.send(frame.bytes)
