@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 '''
-CRSF client in Python. Work via TCP or UART connections.
+CRSF client in Python. Works via TCP or UART connections.
 Can be used to connect to WiFi module on Crossfire.
 It can sniff broadcast frames, receive paramters, etc.
 '''
@@ -41,6 +41,8 @@ class CRSF:
     MSG_TYPE_LINK_STATS = 0x14
     MSG_TYPE_PPM = 0x16                 # channel values
     MSG_TYPE_PPM3 = 0x17                # CRSF V3 (packed channel values)
+    MSG_TYPE_LINK_STATS_RX = 0x1C       # CRSF V3
+    MSG_TYPE_LINK_STATS_TX = 0x1D       # CRSF V3
     MSG_TYPE_ATTD = 0x1E
     MSG_TYPE_MADD = 0x1F
     MSG_TYPE_PING = 0x28
@@ -220,6 +222,13 @@ def ppm_channels_decode(data):
     ticks = [int(data[x:x+11], 2) for x in range(len(data)-11, 0, -11)]
     return list(map(ticks_to_us, ticks))
 
+def link_stats_decode(data):
+    s = 'Uplink: RSSI={}/{}'.format(-data[0], -data[1])
+    s += ', LQI={:3d}%, SNR={}, Ant.={}'.format(data[2], data[3], data[4])
+    s += ', RFmode={}, RFpwr={}'.format(data[5], data[6])
+    s += '; Downlink: RSSI={}, LQI={:3d}%, SNR={}'.format(-data[7], data[8], data[9])
+    return s 
+
 def crsf_log_frame(header, frame):
     '''Print CRSF frame in a partially parsed way'''
     s = str(header) + ': '
@@ -238,6 +247,9 @@ def crsf_log_frame(header, frame):
     if frame.type == CRSF.MSG_TYPE_PPM:
         channels = ppm_channels_decode(frame.payload)
         s += '\n  CH1..16: ' + ', '.join(map(str, channels))
+        return
+    elif frame.type == CRSF.MSG_TYPE_LINK_STATS:
+        s += '\n    ' + link_stats_decode(frame.payload)
     elif frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
         delim = frame.payload.index(0x00)
         device_name, tail = frame.payload[:delim], frame.payload[delim+5:]
