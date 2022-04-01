@@ -229,8 +229,12 @@ def link_stats_decode(data):
     s += '; Downlink: RSSI={}, LQI={:3d}%, SNR={}'.format(-data[7], data[8], data[9])
     return s 
 
+ppm_times = []
+last_time = 0
 def crsf_log_frame(header, frame):
     '''Print CRSF frame in a partially parsed way'''
+
+    global last_time, ppm_times
     s = str(header) + ': '
     data = frame.bytes
     s += 'SYNC ' if data[0] == CRSF.SYNC else ('%02x ' % data[0])
@@ -247,7 +251,14 @@ def crsf_log_frame(header, frame):
     if frame.type == CRSF.MSG_TYPE_PPM:
         channels = ppm_channels_decode(frame.payload)
         s += '\n  CH1..16: ' + ', '.join(map(str, channels))
-        return
+        curr = time.time()*1000
+        ppm_times = [curr] + ppm_times
+        ppm_times = ppm_times[:500]
+        s += ' {:.2f} {:.2f}'.format(curr - last_time, 
+                                            (ppm_times[0] - ppm_times[-1])/len(ppm_times))
+        last_time = curr
+    elif frame.type == CRSF.MSG_TYPE_PPM3:
+        s += '\n  CRSFv3'
     elif frame.type == CRSF.MSG_TYPE_LINK_STATS:
         s += '\n    ' + link_stats_decode(frame.payload)
     elif frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
@@ -295,7 +306,8 @@ class CRSFConnection:
 class TCPConnection(CRSFConnection):
     '''Class for exchanging CRSF over TCP'''
 
-    TIMEOUT_MS = 1000
+    TCP_TIMEOUT_MS = 1000
+    TCP_RECV = 2048
 
     def __init__(self):
         self.parser = crsf_parser()
@@ -303,14 +315,14 @@ class TCPConnection(CRSFConnection):
 
         # Connect via TCP socket
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.settimeout(TCPConnection.TIMEOUT_MS)
+        self.socket.settimeout(TCPConnection.TCP_TIMEOUT_MS)
         self.socket.connect((TCP_HOST, TCP_PORT))
 
     def read_crsf(self):
         # Receive data from serial
         data = None
         try:
-            data = self.socket.recv(2048)
+            data = self.socket.recv(TCPConnection.TCP_RECV)
         except socket.timeout:
             sys.stderr.write('Timeout\n')
         except KeyboardInterrupt:
@@ -324,6 +336,7 @@ class TCPConnection(CRSFConnection):
         # TODO: move to super
         # Parse data
         if data and len(data):
+            #print(len(data))
             for frame in self.parser.digest(data):
                 self.frames.append(frame)
 
@@ -335,6 +348,8 @@ class TCPConnection(CRSFConnection):
 
 class SerialConnection(CRSFConnection):
     '''Class for exchanging CRSF over UART'''
+
+    SERIAL_SLEEP = 0.001
 
     def __init__(self):
         self.parser = crsf_parser()
@@ -351,12 +366,13 @@ class SerialConnection(CRSFConnection):
     def read_thread(self):
         '''Separate thread for receiving frames asynchronously'''
         while self.alive.isSet():
+            # How many bytes are in waiting?
             waiting = self.serial.in_waiting
             data = self.serial.read(waiting if waiting else 1)
             if data and len(data):
                 for frame in self.parser.digest(data):
                     self.in_queue.put(frame, block=False)
-            time.sleep(0.001)
+            time.sleep(SerialConnection.SERIAL_SLEEP)
         print('Exit')
 
     def read_crsf(self):
@@ -410,4 +426,4 @@ if __name__ == '__main__':
                 #frame = create_frame([CRSF.SYNC, 0, CRSF.MSG_TYPE_PARAM_READ, CRSF.TX_ADDR, CRSF.CLOUD_ADDR, 1, 0])
                 #s.send(frame.bytes)
     
-            time.sleep(0.001)
+            time.sleep(0.0001)
