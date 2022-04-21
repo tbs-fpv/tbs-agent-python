@@ -20,6 +20,14 @@ SERIAL_BAUD = 416666
 
 TICK_SPEED = 20      # Ticks per microsecond (for LOG frames)
 
+SHORT_HIST_SIZE = 451   # 90 s
+HIST_SIZE = 10*SHORT_HIST_SIZE
+
+# Text coloring logic
+GREEN, RED = 2, 160     # colors
+fg = lambda text, color: "\33[38;5;" + str(color) + "m" + text + "\33[0m"
+bg = lambda text, color: "\33[48;5;" + str(color) + "m" + text + "\33[0m"
+
 class CRSF:
 
     SYNC = 0xc8
@@ -222,11 +230,32 @@ def ppm_channels_decode(data):
     ticks = [int(data[x:x+11], 2) for x in range(len(data)-11, 0, -11)]
     return list(map(ticks_to_us, ticks))
 
+up_lqi_history, down_lqi_history = [], []
 def link_stats_decode(data):
+    global up_lqi_history, down_lqi_history
+    cur_time = time.time()
+    up_lqi_history.append((cur_time, data[2]))
+    down_lqi_history.append((cur_time, data[8]))
+    up_lqi_history = up_lqi_history[-HIST_SIZE:]
+    down_lqi_history = down_lqi_history[-HIST_SIZE:]
     s = 'Uplink: RSSI={}/{}'.format(-data[0], -data[1])
     s += ', LQI={:3d}%, SNR={}, Ant.={}'.format(data[2], data[3], data[4])
     s += ', RFmode={}, RFpwr={}'.format(data[5], data[6])
     s += '; Downlink: RSSI={}, LQI={:3d}%, SNR={}'.format(-data[7], data[8], data[9])
+
+    # Show average LQI (both uplink and downlink)
+    if len(up_lqi_history) > 1 and len(down_lqi_history) > 1:
+        def get_hist_lqi(lqi_hist):
+            avg = sum([x[1] for x in lqi_hist])/len(lqi_hist)
+            return '{}/{:.1f}'.format(
+                fg('100', GREEN) if avg == 100 else fg('{:.2f}'.format(avg), RED),
+                (lqi_hist[-1][0] - lqi_hist[0][0])
+            )
+        short_up = get_hist_lqi(up_lqi_history[-SHORT_HIST_SIZE:])
+        long_up = get_hist_lqi(up_lqi_history[-HIST_SIZE:])
+        short_down = get_hist_lqi(down_lqi_history[-SHORT_HIST_SIZE:])
+        long_down = get_hist_lqi(down_lqi_history[-HIST_SIZE:])
+        s += '\n    History: Uplink LQI={}, {}; Downlink LQI={}, {}'.format(short_up, long_up, short_down, long_down)
     return s 
 
 ppm_times = []
