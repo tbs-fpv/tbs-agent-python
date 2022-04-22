@@ -6,13 +6,15 @@ Can be used to connect to WiFi module on Crossfire.
 It can sniff broadcast frames, receive paramters, etc.
 '''
 
-import sys, time, functools
-import serial, socket, queue, threading
+# TODO: figure out why TCP doesn't work with the "menu" option
 
-TCP_CONNECTION = False
+import sys, time, functools, os, curses
+import serial, socket, queue, threading
 
 TCP_HOST = '192.168.4.1'
 TCP_PORT = 60950                # this TCP port is used by Fusion
+
+ORIGIN_ADDR = "CRSF.FC_ADDR"
 
 SERIAL_PORT = '/dev/tty.usbserial-AQ00MH7Z'
 SERIAL_BAUD = 416666
@@ -36,10 +38,11 @@ class CRSF:
     BROADCAST_ADDR = 0x00
     CLOUD_ADDR = 0x0E       # MQTT server
     WIFI_ADDR = 0x12
-    VTX_ADDR = 0xCE
     REMOTE_ADDR = 0xEA
     RX_ADDR = 0xEC
     TX_ADDR = 0xEE
+    FC_ADDR = 0xC8          # flight controller
+    VTX_ADDR = 0xCE
 
     # CRSF Frame Types
     MSG_TYPE_GPS = 0x02
@@ -87,7 +90,8 @@ msg_name = {}
 for name in CRSF.__dict__:
     if name.startswith('MSG_TYPE_'):
         msg_name[CRSF.__dict__[name]] = name[9:]
-print(msg_name)
+#print(msg_name)        # show known message types
+ORIGIN_ADDR = eval(ORIGIN_ADDR)
 
 # Device address -> human readable name
 dev_name = {}
@@ -165,10 +169,37 @@ class crsf_frame:
     def payload(self):
         return self.data[5 if self.is_extended else 3:-1]
 
+    def parse(self):
+        if self.type == CRSF.MSG_TYPE_DEVICE_INFO: 
+            delim = self.payload.index(0x00)
+            device_name, tail = self.payload[:delim], self.payload[delim+1:]
+            device_name = bytes(device_name).decode()
+            sn = (tail[0] << 24) | (tail[1] << 16) | (tail[2] << 8) | tail[3]
+            hw_id = (tail[4] << 24) | (tail[5] << 16) | (tail[6] << 8) | tail[7]
+            sw_id = (tail[8] << 24) | (tail[9] << 16) | (tail[10] << 8) | tail[11]
+            param_cnt = tail[12]
+            version = tail[13]
+            return device_name, sn, hw_id, sw_id, param_cnt, version
+        else:
+            raise ValueError("cannot parse frame of type 0x%02x" % self.type)
+
+    def __str__(self):
+        s  = 'SYNC ' if self.bytes[0] == CRSF.SYNC else ('%02x ' % self.bytes[0])
+        s += 'L=%d ' % self.len
+        s += ('(%s) ' % msg_name[self.type]) if self.type in msg_name else ('(t=%02x) ' % self.type)
+        i = 3
+        if self.is_extended:
+            s += '%s->%s ' % (dev_name.get(self.bytes[i+1], '%02x' % self.bytes[i+1]),
+                              dev_name.get(self.bytes[i  ], '%02x' % self.bytes[i  ]))
+            i += 2
+        s += ' '.join(map(lambda x: "%02x" % x, self.bytes[i:]))
+        return s
+
 class crsf_parser:
 
-    def __init__(self):
+    def __init__(self, silent):
         self.data = bytearray()
+        self.silent = silent
 
     def digest(self, data):
         '''Digests incoming bytes, yields complete CRSF frames'''
@@ -176,7 +207,8 @@ class crsf_parser:
         #print(len(self.data))
         while len(self.data) >= 4:
             while self.data and self.data[0] != CRSF.SYNC:
-                sys.stderr.write("byte %02x discarded\n" % self.data[0])
+                if not self.silent:
+                    sys.stderr.write("byte %02x discarded\n" % self.data[0])
                 self.data = self.data[1:]
             if len(self.data) > 1:
                 frame_len = self.data[1] + 2
@@ -187,7 +219,8 @@ class crsf_parser:
                         frame, self.data = self.data[:frame_len], self.data[frame_len:]
                         yield crsf_frame(frame)
                     else:
-                        sys.stderr.write("crc mismatch; byte discarded\n")
+                        if not self.silent:
+                            sys.stderr.write("crc mismatch; byte discarded\n")
                         self.data = self.data[1:]
                 else:
                     break
@@ -291,14 +324,9 @@ def crsf_log_frame(header, frame):
     elif frame.type == CRSF.MSG_TYPE_LINK_STATS:
         s += '\n    ' + link_stats_decode(frame.payload)
     elif frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
-        delim = frame.payload.index(0x00)
-        device_name, tail = frame.payload[:delim], frame.payload[delim+5:]
-        device_name = bytes(device_name).decode()
-        hw_id = (tail[0] << 24) | (tail[1] << 16) | (tail[2] << 8) | tail[3]
-        sw_id = (tail[4] << 24) | (tail[5] << 16) | (tail[6] << 8) | tail[7]
-        param_cnt = tail[8]
-        s += '\n  Device: {name}, HW_ID=0x{hw_id:x}, SW_ID=0x{sw_id:x}, param count={cnt}'.format(
-                        name=device_name, hw_id=hw_id, sw_id=sw_id, cnt=param_cnt)
+        device_name, sn, hw_id, fw_id, param_cnt, version = frame.parse()
+        s += '\n  Device: {name}, S/N=0x{sn:x} HW_ID=0x{hw_id:x}, SW_ID=0x{sw_id:x}, param count={cnt}, v={v}'.format(
+                        sn=sn, name=device_name, hw_id=hw_id, sw_id=fw_id, cnt=param_cnt, v=version)
     elif frame.type == CRSF.MSG_TYPE_PARAM_ENTRY:
         if data[i+3] == CRSF.PARAM_TYPE_INFO:
             name = data[i+4:]
@@ -321,10 +349,36 @@ def crsf_log_frame(header, frame):
 
 def create_frame(data):
     '''Takes CRSF frame data, sets correct length byte and adds CRC8 byte'''
-    frame = bytearray(data)
+    frame = bytearray([CRSF.SYNC, 0]) + bytearray(data)
     frame[CRSF.OFFSET_LENGTH] = len(frame) - 1
     frame.append(calc_crc8(frame[2:]))
     return crsf_frame(frame)
+                
+def create_ping_frame(dest=CRSF.BROADCAST_ADDR, orig=ORIGIN_ADDR):
+    '''Create broadcast PING frame from bytes'''
+    return create_frame([
+        CRSF.MSG_TYPE_PING,         # type
+        dest,                       # destination
+        orig                        # origin
+    ])
+
+def create_device_info_frame(dest=CRSF.BROADCAST_ADDR, orig=ORIGIN_ADDR):
+    '''Return "fake" device information about Agent Python'''
+    name = "Agent Python"
+    return create_frame([
+        CRSF.MSG_TYPE_DEVICE_INFO,  # type
+        dest,                       # destination
+        orig,                       # origin
+        # Payload
+    ] + list(name.encode()) + [     # name of entity
+        0x00,                       # NUL to terminate string
+        0x12, 0x34, 0x56, 0x78,     # S/N
+        0x01, 0x23, 0x45, 0x02,     # HW ID
+        0x00, 0x00, 0x11, 0x11,     # FW ID
+        0x00,                       # parameter total
+        0x01                        # parameter version number
+    ])
+    
 
 class CRSFConnection:
     def read_crsf(self):
@@ -338,9 +392,10 @@ class TCPConnection(CRSFConnection):
     TCP_TIMEOUT_MS = 1000
     TCP_RECV = 2048
 
-    def __init__(self):
-        self.parser = crsf_parser()
+    def __init__(self, silent):
+        self.parser = crsf_parser(silent)
         self.frames = []                # incoming frames that were already parsed
+        self.silent = silent
 
         # Connect via TCP socket
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -353,12 +408,15 @@ class TCPConnection(CRSFConnection):
         try:
             data = self.socket.recv(TCPConnection.TCP_RECV)
         except socket.timeout:
-            sys.stderr.write('Timeout\n')
+            if not self.silent:
+                sys.stderr.write('Timeout\n')
         except KeyboardInterrupt:
-            print('KeyboardInterrup: Quit')
+            if not self.silent:
+                print('KeyboardInterrup: Quit')
             sys.exit(0)
         except Exception as e:
-            sys.stderr.write('ERROR: TCP disconnected\n')
+            if not self.silent:
+                sys.stderr.write('ERROR: TCP disconnected\n')
             del self.socket
             raise(e)
 
@@ -380,8 +438,8 @@ class SerialConnection(CRSFConnection):
 
     SERIAL_SLEEP = 0.001
 
-    def __init__(self):
-        self.parser = crsf_parser()
+    def __init__(self, silent):
+        self.parser = crsf_parser(silent)
         self.serial = serial.Serial(SERIAL_PORT, baudrate=SERIAL_BAUD)
         self.in_queue = queue.Queue()
 
@@ -412,23 +470,35 @@ class SerialConnection(CRSFConnection):
         return frame
 
     def write_crsf(self, frame):
-        pass
-        #self.serial.write(frame.bytes)
+        self.serial.write(frame.bytes)
 
-if __name__ == '__main__':
+def parse_args():
+    '''Parse command line arguments'''
+    import argparse, pathlib
+    arg_parse = argparse.ArgumentParser()
+    arg_parse.add_argument('--tcp', action = 'store_true',
+                         help = 'use TCP connection instead of UART' )
+    arg_parse.add_argument('--menu', action = 'store_true',
+                         help = 'CRSF menu mode (otherwise - logs mode)' )
+    opts = arg_parse.parse_args()
+    return opts
 
+def get_crsf_connection(use_tcp, silent):
+    if not silent:
+        print('Connecting with {}...'.format('TCP' if use_tcp else 'UART'))
+    if use_tcp:
+        return TCPConnection(silent)
+    else:
+        return SerialConnection(silent)
+
+def log_mode(use_tcp):
     print('Press Ctrl+C to exit')
     last_ping = last_read = 0
 
     # Outer loop to reconnect on disconnect
     while True:
     
-        if TCP_CONNECTION:
-            print('Connecting with TCP...')
-            conn = TCPConnection()
-        else:
-            print('Connecting with UART...')
-            conn = SerialConnection()
+        conn = get_crsf_connection(use_tcp, False)
     
         # Update state machine
     
@@ -442,17 +512,207 @@ if __name__ == '__main__':
             # Display data
             if frame:
                 crsf_log_frame('Received', frame)
+
+                # Process frame
+                if frame.type == CRSF.MSG_TYPE_PING:
+                    resp_frame = create_device_info_frame(dest=frame.origin, orig=ORIGIN_ADDR)
+                    conn.write_crsf(resp_frame)
         
             # Send ping frame (need to send something periodically so that connection is not reset)
             if time.time() - last_ping > 10:
                 last_ping = time.time()
     
                 # Send ping frame
-                frame = create_frame([CRSF.SYNC, 0, CRSF.MSG_TYPE_PING, CRSF.BROADCAST_ADDR, CRSF.CLOUD_ADDR])
+                frame = create_ping_frame()
                 crsf_log_frame('Sending ping', frame)
                 conn.write_crsf(frame)
     
-                #frame = create_frame([CRSF.SYNC, 0, CRSF.MSG_TYPE_PARAM_READ, CRSF.TX_ADDR, CRSF.CLOUD_ADDR, 1, 0])
+                #frame = create_frame([CRSF.MSG_TYPE_PARAM_READ, CRSF.TX_ADDR, CRSF.CLOUD_ADDR, 1, 0])
                 #s.send(frame.bytes)
     
             time.sleep(0.0001)
+
+class CRSFParam:
+    pass
+
+class CRSFDevice:
+    '''Holds all the information obtained from a device'''
+
+    def __init__(self, frame):
+        self.name = 0x00
+        self.sn = 0x00
+        self.hwid = 0x00
+        self.fwid = 0x00
+        self.param_cnt = 0
+        self.param_version = 0
+        self.last_seen = 0
+
+        if frame and frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
+            self.name, self.sn, self.hwid, self.fwid, self.param_cnt, self.param_ver = frame.parse()
+            
+        elif frame:
+            raise ValueError("frame of wrong type")
+
+        self.menu = {}      # num -> CRSFParam
+
+    def match(self, frame):
+        if frame and frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
+            return frame.parse() == \
+                (self.name, self.sn, self.hwid, self.fwid, self.param_cnt, self.param_ver)
+        else:
+            raise ValueError("DEVICE_INFO frame expected")
+
+class CRSFMenu:
+    
+    QUIT_KEY = 'q'
+    UP_KEY = 'A'
+    DOWN_KEY = 'B'
+    ENTER_KEY = '\n'
+
+    PING_PERIOD_S = 5     
+    IDLE_TIMEOUT_S = 60
+
+    def __init__(self, stdscr, opts):
+        # Initialize colors
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_RED)
+        curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        self.color = {
+            'WHITE_BLACK': curses.color_pair(1),
+            'WHITE_RED': curses.color_pair(2),
+            'WHITE_BLUE': curses.color_pair(3),
+        }
+
+        self.scr = stdscr
+        self.bor = self.scr.subwin(curses.LINES, curses.COLS , 0, 0)
+        self.win = self.scr.subwin(curses.LINES-2, curses.COLS-2, 1, 1)
+        self.win.nodelay(True)
+
+        # Input events
+        self.last_key = ''
+        self.last_frame = None
+        self.last_sent = None
+
+        # Open a connection for CRSF
+        self.conn = get_crsf_connection(opts.tcp, True)
+
+        # Device addr (1-byte number) to CRSFDevice
+        self.devices = {}
+        self.menu_pos = 0
+
+    def draw_menu(self):
+        '''Encapsulates menu drawing logic'''
+        if not self.devices:
+            self.bor.addstr(1,2, "No devices found")
+            return
+        cnt = 0
+        items = sorted(self.devices.items())
+        if self.menu_pos >= len(items):
+            self.menu_pos = 0
+        elif self.menu_pos < 0: 
+            self.menu_pos = len(items) - 1
+        for addr, device in items:
+            seen_ago = time.time() - device.last_seen
+            if seen_ago < self.IDLE_TIMEOUT_S: 
+                self.bor.move(1 + cnt, 1)
+                self.bor.addstr(device.name, self.color['WHITE_BLUE'] if cnt == self.menu_pos else self.color['WHITE_BLACK'])
+                self.bor.addstr(' ({:.0f}s)'.format(seen_ago))
+                cnt += 1
+            else:
+                del(self.devices[addr])
+
+    def display(self):
+        # clear screen
+        self.scr.clear()
+
+        # Draw window
+        self.bor.border()
+        self.bor.addstr(0,2, "TBS Agent Python - CRSF Menu", curses.A_REVERSE)
+        self.bor.addstr(1,1, self.last_key)
+
+        # Draw debug info
+        if self.last_frame:
+            self.bor.addstr(curses.LINES - 3,1, str(self.last_frame))
+        if self.last_sent:
+            self.bor.addstr(curses.LINES - 2,1, str(self.last_sent))
+
+        self.draw_menu()
+
+        self.bor.refresh()
+
+    def run(self):
+        last_ping = 0 
+        while True:
+            # Process all incoming CRSF frames
+            while True:
+                frame = None
+                try:
+                    frame = self.conn.read_crsf()
+                except Exception as e:
+                    #print("err", e)
+                    break
+
+                # Process an incoming frame
+                if frame and frame.type != CRSF.MSG_TYPE_LINK_STATS:
+                    if frame.type == CRSF.MSG_TYPE_PING:
+                        # Send response to PING
+                        resp_frame = create_device_info_frame(dest=frame.origin, orig=ORIGIN_ADDR)
+                        self.conn.write_crsf(resp_frame)
+                        self.last_sent = resp_frame
+                    elif frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
+                        device = CRSFDevice(frame)
+                        if frame.origin in self.devices and self.devices[frame.origin].match(frame):
+                            self.devices[frame.origin].last_seen = time.time()
+                        else:
+                            # TODO: notify user that the device has changed?
+                            device.last_seen = time.time()
+                            self.devices[frame.origin] = device
+                    self.last_frame = frame
+                else:
+                    break
+
+            # Process keyboard input (if any)
+            try:
+                key = self.win.getkey()
+            except:
+                key = None
+
+            if key is not None:
+                if key == self.QUIT_KEY:
+                    break
+                elif key == self.UP_KEY:
+                    self.menu_pos -= 1
+                elif key == self.DOWN_KEY:
+                    self.menu_pos += 1
+                else:
+                    self.last_key = key
+        
+            # Update screen
+            self.display()
+
+            # Regularly send out PING frame
+            if time.time() - last_ping > self.PING_PERIOD_S:
+                last_ping = time.time()
+    
+                # Send ping frame
+                ping_frame = create_ping_frame()
+                self.conn.write_crsf(ping_frame)
+                self.last_sent = ping_frame
+
+            # Throttle if there is no user input
+            if key is None:
+                time.sleep(0.01)
+
+def crsf_menu_mode(stdscr, opts):
+    man = CRSFMenu(stdscr, opts)
+    man.run()
+
+if __name__ == '__main__':
+    basename = os.path.basename(sys.argv[0])
+    print('TBS Agent Python ({})\n--------------------------'.format(basename))
+
+    opts = parse_args()
+    if opts.menu:
+        curses.wrapper(crsf_menu_mode, opts)
+    else:
+        log_mode(opts.tcp)
