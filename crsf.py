@@ -546,10 +546,11 @@ class CRSFDevice:
         self.param_cnt = 0
         self.param_version = 0
         self.last_seen = 0
+        self.origin = 0
 
         if frame and frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
             self.name, self.sn, self.hwid, self.fwid, self.param_cnt, self.param_ver = frame.parse()
-            
+            self.origin = frame.origin
         elif frame:
             raise ValueError("frame of wrong type")
 
@@ -557,7 +558,8 @@ class CRSFDevice:
 
     def match(self, frame):
         if frame and frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
-            return frame.parse() == \
+            return frame.origin == self.origin and \
+                frame.parse() == \
                 (self.name, self.sn, self.hwid, self.fwid, self.param_cnt, self.param_ver)
         else:
             raise ValueError("DEVICE_INFO frame expected")
@@ -599,27 +601,59 @@ class CRSFMenu:
         # Device addr (1-byte number) to CRSFDevice
         self.devices = {}
         self.menu_pos = 0
+        self.menu_device = None
+        self.displayed_devices = []
 
-    def draw_menu(self):
+    def draw_device_menu(self):
+        self.draw_title(self.menu_device.name)
+
+    def draw_device_list(self):
         '''Encapsulates menu drawing logic'''
+        self.draw_title("CRSF Devices")
+        self.displayed_devices = []
+
+        # Special case: no devices
         if not self.devices:
             self.bor.addstr(1,2, "No devices found")
             return
-        cnt = 0
+
+        # Items to be displayed
         items = sorted(self.devices.items())
+
+        # Update internal state
         if self.menu_pos >= len(items):
             self.menu_pos = 0
         elif self.menu_pos < 0: 
             self.menu_pos = len(items) - 1
-        for addr, device in items:
-            seen_ago = time.time() - device.last_seen
-            if seen_ago < self.IDLE_TIMEOUT_S: 
-                self.bor.move(1 + cnt, 1)
-                self.bor.addstr(device.name, self.color['WHITE_BLUE'] if cnt == self.menu_pos else self.color['WHITE_BLACK'])
-                self.bor.addstr(' ({:.0f}s)'.format(seen_ago))
-                cnt += 1
-            else:
+        self.displayed_devices = [x[1] for x in items]
+
+        # Display all devices
+        for cnt, addr_device in enumerate(items):
+            addr, device = addr_device
+            self.bor.move(1 + cnt, 1)
+            self.bor.addstr(device.name, self.color['WHITE_BLUE'] if cnt == self.menu_pos else self.color['WHITE_BLACK'])
+            self.bor.addstr(' ({:.0f}s)'.format(time.time() - device.last_seen))
+
+    def draw_title(self, title):
+        self.bor.addstr(0,2, "TBS Agent Python - " + title, curses.A_REVERSE)
+
+    def draw_menu(self):
+        '''Encapsulates menu drawing logic'''
+
+        # Remove devices not seen for a long time
+        for addr, device in self.devices.items():
+            if time.time() - device.last_seen >= self.IDLE_TIMEOUT_S:
                 del(self.devices[addr])
+
+        # Check if the current device is still in the list
+        if self.menu_device:
+            if not [x for x in self.devices if self.devices[x] == self.menu_device]:
+                self.menu_device = None
+
+        if self.menu_device:
+            self.draw_device_menu()
+        else:
+            self.draw_device_list()
 
     def display(self):
         # clear screen
@@ -627,16 +661,16 @@ class CRSFMenu:
 
         # Draw window
         self.bor.border()
-        self.bor.addstr(0,2, "TBS Agent Python - CRSF Menu", curses.A_REVERSE)
-        self.bor.addstr(1,1, self.last_key)
 
         # Draw debug info
+        self.bor.addstr(curses.LINES - 4,1, self.last_key)
         if self.last_frame:
             self.bor.addstr(curses.LINES - 3,1, str(self.last_frame))
         if self.last_sent:
             self.bor.addstr(curses.LINES - 2,1, str(self.last_sent))
 
         self.draw_menu()
+        self.bor.move(curses.LINES - 1, curses.COLS - 1)
 
         self.bor.refresh()
 
@@ -679,11 +713,19 @@ class CRSFMenu:
 
             if key is not None:
                 if key == self.QUIT_KEY:
-                    break
+                    if self.menu_device is None:
+                        break
+                    else:
+                        self.menu_device = None
                 elif key == self.UP_KEY:
                     self.menu_pos -= 1
                 elif key == self.DOWN_KEY:
                     self.menu_pos += 1
+                elif key == self.ENTER_KEY:
+                    if self.menu_device is None:
+                        # Enter device menu
+                        if 0 <= self.menu_pos < len(self.displayed_devices):
+                            self.menu_device = self.displayed_devices[self.menu_pos]
                 else:
                     self.last_key = key
         
