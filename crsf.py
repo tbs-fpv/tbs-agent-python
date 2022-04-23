@@ -560,12 +560,17 @@ class CRSFParam:
         self.type = None
         self.name = '...'
         self.chunks = []            # CRSF frames, a list of all chunks
-        self.children = None        # children (only for a folder)
-        self.debug_cb = debug_cb
+        self.children = None        # children (only for a FOLDER_TYPE)
+        self.value = None           # only for INFO_TYPE
         self.hidden = False
+
+        self.debug_cb = debug_cb
 
     def is_folder(self):
         return self.type == self.FOLDER_TYPE
+
+    def is_info(self):
+        return self.type == self.INFO_TYPE
 
     def create_param_read_frame(self, origin):
         # TODO: determine if any chunks are missing or need updating
@@ -628,6 +633,31 @@ class CRSFParam:
                 self.name = name
                 self.hidden = hidden
                 self.debug("command %d OK" % param_num)
+                self.obtained_time = time.time()
+            else:
+                self.debug("error: folder %d: multichunk folders not supported" % param_num)
+                return
+        elif data_type == self.INFO_TYPE:
+            try:
+                nul = 4 + payload[4:].index(0x00)
+                name = bytes(payload[4:nul]).decode()
+            except:
+                # Invalid frame?
+                self.debug('frame error 3: ' + str(frame))
+                return
+            try:
+                end = nul + 1 + payload[nul+1:].index(0x00)
+                value = bytes(payload[nul+1:end]).decode()
+            except:
+                self.debug('frame error 4: ' + str(frame))
+                return
+            if chunks_remain == 0:
+                self.parent_folder = parent_folder
+                self.type = data_type
+                self.name = name
+                self.hidden = hidden
+                self.value = value
+                self.debug("info %d OK" % param_num)
                 self.obtained_time = time.time()
             else:
                 self.debug("error: folder %d: multichunk folders not supported" % param_num)
@@ -858,6 +888,8 @@ class CRSFMenu:
             if device.menu[child]:
                 if device.menu[child].is_folder():
                     self.bor.addstr(' >')
+                elif device.menu[child].is_info():
+                    self.bor.addstr(' ' + device.menu[child].value)
                 if device.menu[child].hidden:
                     self.bor.addstr(' (hidden)')
             self.displayed_params.append(device.menu[child])
