@@ -783,6 +783,7 @@ class CRSFMenu:
         self.debug_txt = None
         self.devices = {}                   # devices which are currently online
         self.menu_pos = 0                   # position in the current menu
+        self.menu_pos_stack = []            # history of menu positions
 
         # - State for the top menu (list of devices)
         self.displayed_devices = []         # devices currently shown in the menu (if not inside a device menu)
@@ -834,6 +835,12 @@ class CRSFMenu:
             return
         folder = device.menu[self.menu_folder]
 
+        # Update internal state
+        if self.menu_pos >= len(folder.children):
+            self.menu_pos = 0
+        elif self.menu_pos < 0: 
+            self.menu_pos = len(folder.children) - 1
+
         # Draw navigation bar
         # TODO: show entire navigation path
         if folder:
@@ -841,10 +848,19 @@ class CRSFMenu:
 
         # Draw folder contents
         # Special case: empty folder
+        self.displayed_params = []
         if not folder.children:
             self.bor.addstr(2,2, "This folder is empty")
         for cnt, child in enumerate(folder.children):
-            self.bor.addstr(2+cnt,2, device.menu[child].name if device.menu[child] else '...')
+            self.bor.move(2+cnt,2)
+            color = self.color['WHITE_BLUE'] if cnt == self.menu_pos else self.color['WHITE_BLACK']
+            self.bor.addstr(device.menu[child].name if device.menu[child] else '...', color)
+            if device.menu[child]:
+                if device.menu[child].is_folder():
+                    self.bor.addstr(' >')
+                if device.menu[child].hidden:
+                    self.bor.addstr(' (hidden)')
+            self.displayed_params.append(device.menu[child])
 
     def draw_device_list(self):
         '''Encapsulates menu drawing logic'''
@@ -966,7 +982,13 @@ class CRSFMenu:
                             self.log_file.close()
                         break
                     else:
-                        self.menu_device = None
+                        self.menu_pos = self.menu_pos_stack.pop()
+                        if not self.menu_pos_stack:
+                            # Go to the top menu - the device list
+                            self.menu_device = None
+                        else:
+                            # Go to the parent folder
+                            self.menu_folder = self.menu_device.menu[self.menu_folder].parent_folder
                 elif key == self.UP_KEY:
                     self.menu_pos -= 1
                 elif key == self.DOWN_KEY:
@@ -976,7 +998,22 @@ class CRSFMenu:
                         # Enter device menu
                         if 0 <= self.menu_pos < len(self.displayed_devices):
                             self.menu_device = self.displayed_devices[self.menu_pos]
+                            self.menu_folder = 0
+                            self.menu_pos_stack.append(self.menu_pos)
+                            self.menu_pos = 0
+                    else:
+                        if 0 <= self.menu_pos < len(self.displayed_params):
+                            if self.displayed_params[self.menu_pos].is_folder():
+                                # Change folder in the device
+                                self.menu_folder = self.displayed_params[self.menu_pos].num
+                                self.menu_pos_stack.append(self.menu_pos)
+                                self.menu_pos = 0
+                            else:
+                                pass # TODO: execute command?
+                        else:
+                            self.debug("error: menu_pos")
                 else:
+                    self.debug("unknown key pressed: " + str(key) + '/' + repr(key))
                     self.last_key = key
         
             # Update screen
