@@ -177,9 +177,9 @@ class crsf_frame:
             sn = (tail[0] << 24) | (tail[1] << 16) | (tail[2] << 8) | tail[3]
             hw_id = (tail[4] << 24) | (tail[5] << 16) | (tail[6] << 8) | tail[7]
             sw_id = (tail[8] << 24) | (tail[9] << 16) | (tail[10] << 8) | tail[11]
-            param_cnt = tail[12]
+            param_count = tail[12]
             version = tail[13]
-            return device_name, sn, hw_id, sw_id, param_cnt, version
+            return device_name, sn, hw_id, sw_id, param_count, version
         else:
             raise ValueError("cannot parse frame of type 0x%02x" % self.type)
 
@@ -324,9 +324,9 @@ def crsf_log_frame(header, frame):
     elif frame.type == CRSF.MSG_TYPE_LINK_STATS:
         s += '\n    ' + link_stats_decode(frame.payload)
     elif frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
-        device_name, sn, hw_id, fw_id, param_cnt, version = frame.parse()
+        device_name, sn, hw_id, fw_id, param_count, version = frame.parse()
         s += '\n  Device: {name}, S/N=0x{sn:x} HW_ID=0x{hw_id:x}, SW_ID=0x{sw_id:x}, param count={cnt}, v={v}'.format(
-                        sn=sn, name=device_name, hw_id=hw_id, sw_id=fw_id, cnt=param_cnt, v=version)
+                        sn=sn, name=device_name, hw_id=hw_id, sw_id=fw_id, cnt=param_count, v=version)
     elif frame.type == CRSF.MSG_TYPE_PARAM_ENTRY:
         if data[i+3] == CRSF.PARAM_TYPE_INFO:
             name = data[i+4:]
@@ -360,6 +360,15 @@ def create_ping_frame(dest=CRSF.BROADCAST_ADDR, orig=ORIGIN_ADDR):
         CRSF.MSG_TYPE_PING,         # type
         dest,                       # destination
         orig                        # origin
+    ])
+
+def create_param_read_frame(dest, param_num, chunk, orig=ORIGIN_ADDR):
+    return create_frame([
+        CRSF.MSG_TYPE_PARAM_READ,   # type
+        dest,                       # destination
+        orig,                       # origin
+        param_num,
+        chunk
     ])
 
 def create_device_info_frame(dest=CRSF.BROADCAST_ADDR, orig=ORIGIN_ADDR):
@@ -533,36 +542,202 @@ def log_mode(use_tcp):
             time.sleep(0.0001)
 
 class CRSFParam:
-    pass
+
+    STRING_TYPE = 0x0a
+    FOLDER_TYPE = 0x0b
+    INFO_TYPE = 0x0c
+    COMMAND_TYPE = 0x0d
+
+    def __init__(self, param_num, debug_cb=None):
+        # TODO: track if parameter is changing frequently or always stable
+        # TODO: poll stable parameters less often
+        # TODO: ensure that different chunks are from short time frame
+        # TODO: detect changes in chunks, invalidate parameter if some chunk changed
+        self.obtained_time = 0      # when was this parameter last refreshed?
+        self.num = param_num
+        self.parent_folder = None
+        self.total_chunks = 0
+        self.type = None
+        self.name = '...'
+        self.chunks = []            # CRSF frames, a list of all chunks
+        self.children = None        # children (only for a folder)
+        self.debug_cb = debug_cb
+        self.hidden = False
+
+    def is_folder(self):
+        return self.type == self.FOLDER_TYPE
+
+    def create_param_read_frame(self, origin):
+        # TODO: determine if any chunks are missing or need updating
+        frame = create_param_read_frame(origin, self.num, 0)
+        return frame
+
+    def debug(self, txt):
+        if self.debug_cb:
+            self.debug_cb(txt)
+
+    def process_frame(self, frame):
+        '''Parse parameter information frame'''
+        if frame.type != CRSF.MSG_TYPE_PARAM_ENTRY:
+            self.debug('invalid frame type')
+            return
+        payload = frame.payload
+        param_num, chunks_remain, parent_folder, data_type = payload[:4]
+        hidden, data_type = data_type & 0x80, data_type & 0x7F
+        if chunks_remain:
+            self.debug("error: chunks remain: " + str(frame))
+            return
+        if data_type == self.FOLDER_TYPE:
+            try:
+                nul = 4 + payload[4:].index(0x00)
+                name = bytes(payload[4:nul]).decode()
+            except:
+                # Invalid frame?
+                self.debug('frame error: ' + str(frame))
+                return
+            try:
+                end = nul + 1 + payload[nul+1:].index(0xFF)
+                children = list(payload[nul+1:end])
+            except:
+                self.debug('frame error 2: ' + str(frame))
+                return
+
+            # Folder frame parsed successfully
+            if chunks_remain == 0:
+                self.children = children
+                self.parent_folder = parent_folder
+                self.type = data_type
+                self.name = name
+                self.hidden = hidden
+                self.debug("folder %d OK" % param_num)
+                self.obtained_time = time.time()
+            else:
+                self.debug("error: folder %d: multichunk folders not supported" % param_num)
+                return
+        elif data_type == self.COMMAND_TYPE:
+            try:
+                nul = 4 + payload[4:].index(0x00)
+                name = bytes(payload[4:nul]).decode()
+            except:
+                # Invalid frame?
+                self.debug('frame error: ' + str(frame))
+                return
+            if chunks_remain == 0:
+                self.parent_folder = parent_folder
+                self.type = data_type
+                self.name = name
+                self.hidden = hidden
+                self.debug("command %d OK" % param_num)
+                self.obtained_time = time.time()
+            else:
+                self.debug("error: folder %d: multichunk folders not supported" % param_num)
+                return
+        else:
+            self.debug("error: data_type %d" % data_type)
+            self.type = data_type
+            if chunks_remain == 0:
+                self.obtained_time = time.time()
 
 class CRSFDevice:
     '''Holds all the information obtained from a device'''
 
-    def __init__(self, frame):
+    POLL_PERIOD_S = 2.0
+    POLL_RESPONSE_SPEED_UP_FACTOR = 0.95
+    FOLDER_PERIOD_S = 10
+
+    class InvalidType(ValueError):
+        pass
+
+    def __init__(self, frame, menu_ui, debug_cb=None):
+        self.origin = 0             # network address of this device
+        self.last_seen = 0          # when was the last time "device information" was obtained from the device?
+        self.last_read = 0          # when was the last time "param read" was sent to the device?
+        self.last_read_chunk = (0, 0)
+
+        # Parsed from "device information" frame
         self.name = 0x00
         self.sn = 0x00
         self.hwid = 0x00
         self.fwid = 0x00
-        self.param_cnt = 0
+        self.param_count = 0
         self.param_version = 0
-        self.last_seen = 0
-        self.origin = 0
 
         if frame and frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
-            self.name, self.sn, self.hwid, self.fwid, self.param_cnt, self.param_ver = frame.parse()
+            self.name, self.sn, self.hwid, self.fwid, self.param_count, self.param_ver = frame.parse()
             self.origin = frame.origin
         elif frame:
             raise ValueError("frame of wrong type")
 
-        self.menu = {}      # num -> CRSFParam
+        # List of CRSFParam objects, first object - root folder
+        self.menu = [None]*(self.param_count + 1)
+
+        self.menu_ui = menu_ui
+        self.debug_cb = debug_cb
+
+    def debug(self, txt):
+        if self.debug_cb:
+            self.debug_cb(txt)
 
     def match(self, frame):
+        '''Compare device information of this device to "device information" frame'''
         if frame and frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
             return frame.origin == self.origin and \
                 frame.parse() == \
-                (self.name, self.sn, self.hwid, self.fwid, self.param_cnt, self.param_ver)
+                (self.name, self.sn, self.hwid, self.fwid, self.param_count, self.param_ver)
         else:
             raise ValueError("DEVICE_INFO frame expected")
+
+    def poll_params(self, conn, folder):
+        '''Periodically send out "param read" frames for the parameters in current folder'''
+        if not (0 <= folder < len(self.menu)):
+            self.debug('invalid folder %s' % str(folder))
+            return
+        if time.time() - self.last_read < self.POLL_PERIOD_S:
+            return
+        self.last_read = time.time()
+
+        if self.menu[folder] is None:
+            self.menu[folder] = CRSFParam(folder, debug_cb=self.debug_cb)
+        elif self.menu[folder].obtained_time and not self.menu[folder].is_folder():
+            raise CRSFDevice.InvalidType('folder type expected')
+
+        # Decide which parameter to load
+        frame = None
+        if not self.menu[folder].obtained_time or time.time() - self.menu[folder].obtained_time > self.FOLDER_PERIOD_S:
+            # Load the current folder itself
+            frame = self.menu[folder].create_param_read_frame(self.origin)
+        elif self.menu[folder].obtained_time:
+            oldest_time, oldest_child = None, None
+            for child in self.menu[folder].children:
+                if self.menu[child] is None or not self.menu[child].obtained_time:
+                    self.menu[child] = CRSFParam(child, debug_cb=self.debug_cb)
+                    frame = self.menu[child].create_param_read_frame(self.origin)
+                    break
+                elif oldest_time is None or time.time() - self.menu[child].obtained_time > oldest_time:
+                    oldest_time = time.time() - self.menu[child].obtained_time
+                    oldest_child = child
+            if frame is None and oldest_child is not None:
+                frame = self.menu[oldest_child].create_param_read_frame(self.origin)
+            # TODO: determine the parameter in the current folder which was not updated in the longest time
+
+        if frame:
+            # TODO: replace this with two callbacks: menu_id.write_crsf and menu_ui.debug
+            self.menu_ui.write_crsf(frame)
+            self.last_read_chunk = (frame.payload[0], frame.payload[1])
+
+    def process_frame(self, frame):
+        '''Process frame from this device'''
+        if frame.type == CRSF.MSG_TYPE_PARAM_ENTRY:
+            # TODO: process "param entry" frame
+            param_num = frame.payload[0]
+            if self.last_read_chunk == (frame.payload[0], frame.payload[1]):
+                self.last_read -= self.POLL_PERIOD_S * self.POLL_RESPONSE_SPEED_UP_FACTOR
+            if 0 <= param_num < len(self.menu):
+                if isinstance(self.menu[param_num], CRSFParam):
+                    self.menu[param_num].process_frame(frame)
+            else:
+                # TODO: report error: unexpected parameter number
+                pass
 
 class CRSFMenu:
     
@@ -572,17 +747,22 @@ class CRSFMenu:
     ENTER_KEY = '\n'
 
     PING_PERIOD_S = 5     
+    ONLINE_THRES_S = 30
     IDLE_TIMEOUT_S = 60
+
+    CAPTURE_LOGS = False
 
     def __init__(self, stdscr, opts):
         # Initialize colors
         curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)
         curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_RED)
         curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(4, curses.COLOR_GREEN, curses.COLOR_WHITE)
         self.color = {
             'WHITE_BLACK': curses.color_pair(1),
             'WHITE_RED': curses.color_pair(2),
             'WHITE_BLUE': curses.color_pair(3),
+            'GREEN_WHITE': curses.color_pair(4),
         }
 
         self.scr = stdscr
@@ -599,13 +779,72 @@ class CRSFMenu:
         self.conn = get_crsf_connection(opts.tcp, True)
 
         # Device addr (1-byte number) to CRSFDevice
-        self.devices = {}
-        self.menu_pos = 0
-        self.menu_device = None
-        self.displayed_devices = []
+        # - Common state
+        self.debug_txt = None
+        self.devices = {}                   # devices which are currently online
+        self.menu_pos = 0                   # position in the current menu
 
+        # - State for the top menu (list of devices)
+        self.displayed_devices = []         # devices currently shown in the menu (if not inside a device menu)
+
+        # - State for the device menus
+        self.menu_device = None             # currently selected device
+        self.menu_folder = 0                # currently selected folder of a device
+        self.displayed_params = []          # parameters currently show in the menu (if inside a device menu)
+
+        if self.CAPTURE_LOGS:
+            self.log_file = open('log_file.txt','w')
+
+    def debug(self, txt):
+        if txt:
+            self.debug_txt = txt
+
+    def write_crsf(self, frame):
+        self.conn.write_crsf(frame)
+        self.last_sent = frame
+        if self.CAPTURE_LOGS:
+            self.log_file.write('< ' + str(frame) + '\n')
+
+    def draw_title(self, title, flags=None):
+        sup_title = "TBS Agent Python - "
+        self.bor.addstr(0,2, sup_title, curses.A_REVERSE)
+        self.bor.addstr(0,len(sup_title)+2, title, flags if flags else curses.A_REVERSE)
+
+    def draw_device_info(self, device):
+        # TODO: show device information (S/N, HW ID, FW ID, last DEVICE INFO, number of parameters, etc.)
+        seen_ago = time.time() - device.last_seen
+        flags = self.color['GREEN_WHITE'] if seen_ago <= self.ONLINE_THRES_S else None
+ 
     def draw_device_menu(self):
-        self.draw_title(self.menu_device.name)
+        device = self.menu_device
+        self.draw_title(device.name)
+
+        # Special case: device with no parameters
+        if device.param_count == 0:
+            self.bor.addstr(1,2, "This device has no parameters")
+            return
+
+        # Check for correctness
+        if not (0 <= self.menu_folder < len(device.menu)) or \
+           not device.menu[self.menu_folder] or \
+           not device.menu[self.menu_folder].is_folder():
+            self.menu_folder = 0
+        if not device.menu[self.menu_folder] or not device.menu[self.menu_folder].is_folder():
+            self.debug("invalid folder {}".format(self.menu_folder))
+            return
+        folder = device.menu[self.menu_folder]
+
+        # Draw navigation bar
+        # TODO: show entire navigation path
+        if folder:
+            self.bor.addstr(1,1, folder.name + ' >') 
+
+        # Draw folder contents
+        # Special case: empty folder
+        if not folder.children:
+            self.bor.addstr(2,2, "This folder is empty")
+        for cnt, child in enumerate(folder.children):
+            self.bor.addstr(2+cnt,2, device.menu[child].name if device.menu[child] else '...')
 
     def draw_device_list(self):
         '''Encapsulates menu drawing logic'''
@@ -634,9 +873,6 @@ class CRSFMenu:
             self.bor.addstr(device.name, self.color['WHITE_BLUE'] if cnt == self.menu_pos else self.color['WHITE_BLACK'])
             self.bor.addstr(' ({:.0f}s)'.format(time.time() - device.last_seen))
 
-    def draw_title(self, title):
-        self.bor.addstr(0,2, "TBS Agent Python - " + title, curses.A_REVERSE)
-
     def draw_menu(self):
         '''Encapsulates menu drawing logic'''
 
@@ -655,6 +891,9 @@ class CRSFMenu:
         else:
             self.draw_device_list()
 
+    def draw_debug(self, info):
+        self.bor.addstr(curses.LINES - 5,1, str(info))
+
     def display(self):
         # clear screen
         self.scr.clear()
@@ -663,6 +902,8 @@ class CRSFMenu:
         self.bor.border()
 
         # Draw debug info
+        if self.debug_txt is not None:
+            self.draw_debug('Debug: ' + self.debug_txt)
         self.bor.addstr(curses.LINES - 4,1, self.last_key)
         if self.last_frame:
             self.bor.addstr(curses.LINES - 3,1, str(self.last_frame))
@@ -682,6 +923,8 @@ class CRSFMenu:
                 frame = None
                 try:
                     frame = self.conn.read_crsf()
+                    if frame and self.CAPTURE_LOGS:
+                        self.log_file.write('> ' + str(frame) + '\n')
                 except Exception as e:
                     #print("err", e)
                     break
@@ -691,16 +934,21 @@ class CRSFMenu:
                     if frame.type == CRSF.MSG_TYPE_PING:
                         # Send response to PING
                         resp_frame = create_device_info_frame(dest=frame.origin, orig=ORIGIN_ADDR)
-                        self.conn.write_crsf(resp_frame)
-                        self.last_sent = resp_frame
+                        self.write_crsf(resp_frame)
                     elif frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
-                        device = CRSFDevice(frame)
+                        device = CRSFDevice(frame, self, self.debug)
                         if frame.origin in self.devices and self.devices[frame.origin].match(frame):
                             self.devices[frame.origin].last_seen = time.time()
                         else:
                             # TODO: notify user that the device has changed?
                             device.last_seen = time.time()
                             self.devices[frame.origin] = device
+                    elif frame.type == CRSF.MSG_TYPE_PARAM_ENTRY:
+                        if frame.origin in self.devices:
+                            self.devices[frame.origin].process_frame(frame)
+                        else:
+                            pass # TODO: display error: received parameter from unseen/unrequested device
+                    # For debug output
                     self.last_frame = frame
                 else:
                     break
@@ -714,6 +962,8 @@ class CRSFMenu:
             if key is not None:
                 if key == self.QUIT_KEY:
                     if self.menu_device is None:
+                        if self.CAPTURE_LOGS:
+                            self.log_file.close()
                         break
                     else:
                         self.menu_device = None
@@ -732,14 +982,21 @@ class CRSFMenu:
             # Update screen
             self.display()
 
+            # Regularly send out READ frames to selected device
+            if self.menu_device:
+                try:
+                    self.menu_device.poll_params(self.conn, self.menu_folder)
+                except CRSFDevice.InvalidType as e:
+                    self.debug(str(e))
+                    self.menu_device = None
+
             # Regularly send out PING frame
             if time.time() - last_ping > self.PING_PERIOD_S:
                 last_ping = time.time()
     
                 # Send ping frame
                 ping_frame = create_ping_frame()
-                self.conn.write_crsf(ping_frame)
-                self.last_sent = ping_frame
+                self.write_crsf(ping_frame)
 
             # Throttle if there is no user input
             if key is None:
