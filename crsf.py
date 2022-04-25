@@ -8,10 +8,9 @@ It can sniff broadcast frames, receive paramters, etc.
 
 # TODO: figure out why TCP doesn't work with the "menu" option
 # TODO: implement commands
-# TODO: smarter selection options navigation
-# TODO: implement string input
 # TODO: implement numeric input
 # TODO: introduce more command-line arguments: port, baud, host, origin
+# TODO: smarter selection options navigation
 
 import sys, time, functools, os, curses
 import serial, socket, queue, threading
@@ -376,15 +375,14 @@ def create_param_read_frame(dest, param_num, chunk, orig=ORIGIN_ADDR):
         chunk
     ])
 
-def create_param_write_frame(dest, param_num, value, orig=ORIGIN_ADDR):
-    # TODO: value is assumed to be 1 byte, which is not always the case
+def create_param_write_frame(dest, param_num, value: bytearray, orig=ORIGIN_ADDR):
     return create_frame([
         CRSF.MSG_TYPE_PARAM_WRITE,  # type
         dest,                       # destination
         orig,                       # origin
-        param_num,
-        value
-    ])
+        param_num] +
+        list(value)
+    )
 
 def create_device_info_frame(dest=CRSF.BROADCAST_ADDR, orig=ORIGIN_ADDR):
     '''Return "fake" device information about Agent Python'''
@@ -637,8 +635,11 @@ class CRSFParam:
         frame = create_param_read_frame(origin, self.num, chunk)
         return frame
 
-    def create_write_frame(self, origin, value):
-        return create_param_write_frame(origin, self.num, value)
+    def create_write_frame(self, origin, value: bytearray):
+        if value is not None:
+            return create_param_write_frame(origin, self.num, value)
+        else:
+            self.debug('error: value is None')
 
     def debug(self, txt):
         if self.debug_cb:
@@ -760,6 +761,24 @@ class CRSFParam:
                 self.default = val_def
                 self.max = val_max
                 self.debug("selection %d OK" % (val_max + 1))
+                self.obtained_time = time.time()
+            else:
+                self.debug("error: folder %d: multichunk folders not supported" % param_num)
+                return
+        elif data_type == self.STRING_TYPE:
+            try:
+                end = nul + 1 + payload[nul+1:].index(0x00)
+                value = bytes(payload[nul+1:end]).decode()
+            except:
+                self.debug('frame error 7: ' + str(frame))
+                return
+            if chunks_remain == 0:
+                self.parent_folder = parent_folder
+                self.type = data_type
+                self.name = name
+                self.hidden = hidden
+                self.value = value
+                self.debug("string OK")
                 self.obtained_time = time.time()
             else:
                 self.debug("error: folder %d: multichunk folders not supported" % param_num)
@@ -887,6 +906,7 @@ class CRSFMenu:
     UP_KEY = 'A'
     DOWN_KEY = 'B'
     ENTER_KEY = '\n'
+    BACKSPACE_KEY = '\x7f'
 
     PING_PERIOD_S = 5     
     ONLINE_THRES_S = 30
@@ -948,6 +968,7 @@ class CRSFMenu:
         # - State for "dialogue" window
         self.dialog_param = None
         self.dialog_pos = 0
+        self.dialog_val = ''                # string/number input
 
         if self.CAPTURE_LOGS:
             self.log_file = open('log_file.txt','w')
@@ -992,7 +1013,11 @@ class CRSFMenu:
         self.sub_win.move(0,0)
         if self.dialog_param.is_string_input():
             self.sub_win.addstr('Input string: ')
-            self.sub_win.addstr('Not implemented', self.color['WHITE_RED'])
+            self.sub_win.move(1,0)
+            val = (self.dialog_val + ' '*w)[:w-1]
+            self.sub_win.addstr(val, curses.A_REVERSE)
+            self.sub_win.move(2,0)
+            self.sub_win.addstr("NOTE: Input with keyboard may be buggy")
         elif self.dialog_param.is_selection():
             if self.dialog_pos < 0:
                 self.dialog_pos = len(self.dialog_param.options) - 1
@@ -1051,14 +1076,15 @@ class CRSFMenu:
             self.bor.move(2+cnt,2)
             sel_color = ((self.color['WHITE_BLUE'] | curses.A_BOLD) if cnt == self.menu_pos else self.color['WHITE_BLACK'])
             key = device.menu[child].name if device.menu[child] and device.menu[child].name else '...'
-            if device.menu[child] and not device.menu[child].is_selection():
+            if device.menu[child] and not device.menu[child].is_selection() and not device.menu[child].is_string_input():
                 self.bor.addstr(key, sel_color)
             else:
                 self.bor.addstr(key)
             if device.menu[child]:
                 if device.menu[child].is_folder():
                     self.bor.addstr(' >')
-                elif device.menu[child].is_info() or device.menu[child].is_selection():
+                elif device.menu[child].is_info() or device.menu[child].is_selection() or \
+                     device.menu[child].is_string_input():
                     if key[-1] != ':':
                         self.bor.addstr(':')
                         key += ':'
@@ -1067,6 +1093,10 @@ class CRSFMenu:
                         self.bor.addstr(' '*(WIDTH-len(key)))
                     if device.menu[child].is_info():
                         self.bor.addstr(' ' + device.menu[child].value)
+                    elif device.menu[child].is_string_input():
+                        flags = (self.color['WHITE_RED'] | curses.A_BOLD) if cnt == self.menu_pos else curses.A_REVERSE
+                        self.bor.addstr(' ')
+                        self.bor.addstr(device.menu[child].value, flags)
                     elif device.menu[child].is_selection():
                         self.bor.addstr(' ')
                         self.bor.addstr('<', sel_color)
@@ -1224,6 +1254,9 @@ class CRSFMenu:
                         self.dialog_pos += 1
                     else:
                         self.menu_pos += 1
+                elif key == self.BACKSPACE_KEY:
+                    if self.dialog_param and self.dialog_param.is_string_input():
+                        self.dialog_val = ''
                 elif key == self.ENTER_KEY:
                     if self.menu_device is None:
                         # Enter device menu
@@ -1233,6 +1266,7 @@ class CRSFMenu:
                             self.menu_pos_stack.append(self.menu_pos)
                             self.menu_pos = 0
                     elif self.dialog_param is None:
+                        # Navigate the device menu
                         if 0 <= self.menu_pos < len(self.displayed_params):
                             if self.displayed_params[self.menu_pos].is_folder():
                                 # Change folder in the device
@@ -1242,11 +1276,21 @@ class CRSFMenu:
                             elif self.displayed_params[self.menu_pos].is_input():
                                 self.dialog_param = self.displayed_params[self.menu_pos]
                                 self.dialog_pos = 0
+                                self.dialog_val = str(self.displayed_params[self.menu_pos].value)
                         else:
                             self.debug("error: menu_pos")
                     else:
-                        write_frame = self.dialog_param.create_write_frame(self.menu_device.origin, self.dialog_pos)
+                        # Set parameter to the currently selected value
+                        if self.dialog_param.is_string_input():
+                            val = bytearray(self.dialog_val.encode()) + bytearray(b'\x00')
+                        elif self.dialog_param.is_selection():
+                            val = [self.dialog_pos]
+                        else:
+                            val = None
+                        write_frame = self.dialog_param.create_write_frame(self.menu_device.origin, val)
                         self.write_crsf(write_frame)
+                elif self.dialog_param and self.dialog_param.is_string_input():
+                    self.dialog_val += key
                 else:
                     self.debug("unknown key pressed: " + str(key) + '/' + repr(key))
                     self.last_key = key
