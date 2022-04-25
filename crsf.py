@@ -8,9 +8,10 @@ It can sniff broadcast frames, receive paramters, etc.
 
 # TODO: figure out why TCP doesn't work with the "menu" option
 # TODO: implement commands
-# TODO: implement selection
+# TODO: smarter selection options navigation
 # TODO: implement string input
 # TODO: implement numeric input
+# TODO: introduce more command-line arguments: port, baud, host, origin
 
 import sys, time, functools, os, curses
 import serial, socket, queue, threading
@@ -375,6 +376,16 @@ def create_param_read_frame(dest, param_num, chunk, orig=ORIGIN_ADDR):
         chunk
     ])
 
+def create_param_write_frame(dest, param_num, value, orig=ORIGIN_ADDR):
+    # TODO: value is assumed to be 1 byte, which is not always the case
+    return create_frame([
+        CRSF.MSG_TYPE_PARAM_WRITE,  # type
+        dest,                       # destination
+        orig,                       # origin
+        param_num,
+        value
+    ])
+
 def create_device_info_frame(dest=CRSF.BROADCAST_ADDR, orig=ORIGIN_ADDR):
     '''Return "fake" device information about Agent Python'''
     name = "Agent Python"
@@ -595,6 +606,9 @@ class CRSFParam:
     def is_info(self):
         return self.type == self.INFO_TYPE
 
+    def is_string_input(self):
+        return self.type == self.STRING_TYPE
+
     def is_selection(self):
         return self.type == self.TEXT_SELECTION_TYPE
 
@@ -606,6 +620,9 @@ class CRSFParam:
                               self.UINT8_TYPE,  self.INT8_TYPE,
                              self.UINT16_TYPE, self.INT16_TYPE,
                              self.UINT32_TYPE, self.INT32_TYPE]
+
+    def is_input(self):
+        return self.is_command() or self.is_string_input() or self.is_number_input() or self.is_selection()
 
     def create_param_read_frame(self, origin):
         if self.chunks:
@@ -619,6 +636,9 @@ class CRSFParam:
             chunk = 0
         frame = create_param_read_frame(origin, self.num, chunk)
         return frame
+
+    def create_write_frame(self, origin, value):
+        return create_param_write_frame(origin, self.num, value)
 
     def debug(self, txt):
         if self.debug_cb:
@@ -746,7 +766,11 @@ class CRSFParam:
                 return
         else:
             self.debug("error: data_type %d" % data_type)
+            self.parent_folder = parent_folder
             self.type = data_type
+            self.name = name
+            self.type = data_type
+            self.hidden = hidden
             if chunks_remain == 0:
                 self.obtained_time = time.time()
 
@@ -892,6 +916,12 @@ class CRSFMenu:
         self.win = self.scr.subwin(curses.LINES-2, curses.COLS-2, 1, 1)
         self.win.nodelay(True)
 
+        # Dialogue window
+        h, w = curses.LINES // 2, curses.COLS // 2
+        sy, sx = (curses.LINES - h ) // 2, (curses.COLS - w) // 2
+        self.sub_bor = self.scr.subwin(h, w, sy, sx)
+        self.sub_win = self.scr.subwin(h-2, w-2, sy+1, sx+1)
+
         # Input events
         self.last_key = ''
         self.last_frame = None
@@ -914,6 +944,10 @@ class CRSFMenu:
         self.menu_device = None             # currently selected device
         self.menu_folder = 0                # currently selected folder of a device
         self.displayed_params = []          # parameters currently show in the menu (if inside a device menu)
+
+        # - State for "dialogue" window
+        self.dialog_param = None
+        self.dialog_pos = 0
 
         if self.CAPTURE_LOGS:
             self.log_file = open('log_file.txt','w')
@@ -939,6 +973,44 @@ class CRSFMenu:
         # TODO: show device information (S/N, HW ID, FW ID, last DEVICE INFO, number of parameters, etc.)
         seen_ago = time.time() - device.last_seen
         flags = self.color['GREEN_WHITE'] if seen_ago <= self.ONLINE_THRES_S else None
+
+    def draw_dialogue(self):
+        '''Dialogue is a secondary window for user input'''
+        self.sub_bor.border()
+        self.sub_bor.move(0, 2)
+        if self.dialog_param.is_selection():
+            title = 'Select "' + self.dialog_param.name + '":'
+        else:
+            title = self.dialog_param.name
+        self.sub_bor.addstr(title, curses.A_REVERSE)
+
+        # Clear window
+        h, w = self.sub_win.getmaxyx()
+        self.sub_win.move(0, 0)
+        self.sub_win.addstr(' '*(h*w-1), self.color['WHITE_BLACK'])
+
+        self.sub_win.move(0,0)
+        if self.dialog_param.is_string_input():
+            self.sub_win.addstr('Input string: ')
+            self.sub_win.addstr('Not implemented', self.color['WHITE_RED'])
+        elif self.dialog_param.is_selection():
+            if self.dialog_pos < 0:
+                self.dialog_pos = len(self.dialog_param.options) - 1
+            elif self.dialog_pos >= len(self.dialog_param.options):
+                self.dialog_pos = 0
+            for cnt, opt in enumerate(self.dialog_param.options):
+                if cnt < h:
+                    if cnt == self.dialog_pos:
+                        sel_color = (self.color['WHITE_BLUE'] | curses.A_BOLD)
+                    else:
+                        sel_color = self.color['WHITE_BLACK']
+                    self.sub_win.move(cnt,0)
+                    self.sub_win.addstr(opt, sel_color)
+        elif self.dialog_param.is_number_input():
+            self.sub_win.addstr('Input value: ')
+            self.sub_win.addstr('Not implemented', self.color['WHITE_RED'])
+        elif self.dialog_param.is_command():
+            self.sub_win.addstr('Command. Not implemented', self.color['WHITE_RED'])
  
     def draw_device_menu(self):
         device = self.menu_device
@@ -1008,6 +1080,10 @@ class CRSFMenu:
                 if device.menu[child].hidden:
                     self.bor.addstr(' (hidden)', self.color['CYAN_BLACK'])
             self.displayed_params.append(device.menu[child])
+
+        # Draw dialogue window, if open
+        if self.dialog_param:
+            self.draw_dialogue()
 
     def draw_device_list(self):
         '''Encapsulates menu drawing logic'''
@@ -1128,7 +1204,7 @@ class CRSFMenu:
                         if self.CAPTURE_LOGS:
                             self.log_file.close()
                         break
-                    else:
+                    elif self.dialog_param is None:
                         self.menu_pos = self.menu_pos_stack.pop()
                         if not self.menu_pos_stack:
                             # Go to the top menu - the device list
@@ -1136,10 +1212,18 @@ class CRSFMenu:
                         else:
                             # Go to the parent folder
                             self.menu_folder = self.menu_device.menu[self.menu_folder].parent_folder
+                    else:
+                        self.dialog_param = None
                 elif key == self.UP_KEY:
-                    self.menu_pos -= 1
+                    if self.dialog_param:
+                        self.dialog_pos -= 1
+                    else:
+                        self.menu_pos -= 1
                 elif key == self.DOWN_KEY:
-                    self.menu_pos += 1
+                    if self.dialog_param:
+                        self.dialog_pos += 1
+                    else:
+                        self.menu_pos += 1
                 elif key == self.ENTER_KEY:
                     if self.menu_device is None:
                         # Enter device menu
@@ -1148,17 +1232,21 @@ class CRSFMenu:
                             self.menu_folder = 0
                             self.menu_pos_stack.append(self.menu_pos)
                             self.menu_pos = 0
-                    else:
+                    elif self.dialog_param is None:
                         if 0 <= self.menu_pos < len(self.displayed_params):
                             if self.displayed_params[self.menu_pos].is_folder():
                                 # Change folder in the device
                                 self.menu_folder = self.displayed_params[self.menu_pos].num
                                 self.menu_pos_stack.append(self.menu_pos)
                                 self.menu_pos = 0
-                            else:
-                                pass # TODO: execute command?
+                            elif self.displayed_params[self.menu_pos].is_input():
+                                self.dialog_param = self.displayed_params[self.menu_pos]
+                                self.dialog_pos = 0
                         else:
                             self.debug("error: menu_pos")
+                    else:
+                        write_frame = self.dialog_param.create_write_frame(self.menu_device.origin, self.dialog_pos)
+                        self.write_crsf(write_frame)
                 else:
                     self.debug("unknown key pressed: " + str(key) + '/' + repr(key))
                     self.last_key = key
