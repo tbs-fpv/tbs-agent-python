@@ -7,6 +7,10 @@ It can sniff broadcast frames, receive paramters, etc.
 '''
 
 # TODO: figure out why TCP doesn't work with the "menu" option
+# TODO: implement commands
+# TODO: implement selection
+# TODO: implement string input
+# TODO: implement numeric input
 
 import sys, time, functools, os, curses
 import serial, socket, queue, threading
@@ -542,11 +546,27 @@ def log_mode(use_tcp):
             time.sleep(0.0001)
 
 class CRSFParam:
-
-    STRING_TYPE = 0x0a
-    FOLDER_TYPE = 0x0b
-    INFO_TYPE = 0x0c
+    '''
+    CRSF parameters are, basically, key-value pairs.
+    "Key" is the name of the parameter. "Value" is modifiable by user
+    (except for INFO type, for which the value is constant).
+    '''
+    
+    # Parameter types determine the type of the value
+    TEXT_SELECTION_TYPE = 0x09      # value is uint8_t, with a list of options
+    STRING_TYPE = 0x0a              # value is a string, entered by user directly
+    FOLDER_TYPE = 0x0b              # no modifiable value; groups other parameters
+    INFO_TYPE = 0x0c                # value is constant, CANNOT be modified
     COMMAND_TYPE = 0x0d
+    
+    # Numeric types (in practice, rarely used)
+    UINT8_TYPE = 0
+    INT8_TYPE = 1
+    UINT16_TYPE = 2
+    INT16_TYPE = 3
+    UINT32_TYPE = 4
+    INT32_TYPE = 5
+    FLOAT_TYPE = 8
 
     def __init__(self, param_num, debug_cb=None):
         # TODO: track if parameter is changing frequently or always stable
@@ -561,10 +581,13 @@ class CRSFParam:
         self.name = '...'
         self.chunks = []            # CRSF frames, a list of all chunks
         self.children = None        # children (only for a FOLDER_TYPE)
-        self.value = None           # only for INFO_TYPE
+        self.value = None           # except for FOLDER_TYPE
         self.hidden = False
+        self.min = self.default = self.max = None
+        self.options = []           # only for TEXT_SELECTION
 
         self.debug_cb = debug_cb
+        self.created_time = time.time()
 
     def is_folder(self):
         return self.type == self.FOLDER_TYPE
@@ -572,9 +595,29 @@ class CRSFParam:
     def is_info(self):
         return self.type == self.INFO_TYPE
 
+    def is_selection(self):
+        return self.type == self.TEXT_SELECTION_TYPE
+
+    def is_command(self):
+        return self.type == self.COMMAND_TYPE
+
+    def is_number_input(self):
+        return self.type in [self.FLOAT_TYPE,
+                              self.UINT8_TYPE,  self.INT8_TYPE,
+                             self.UINT16_TYPE, self.INT16_TYPE,
+                             self.UINT32_TYPE, self.INT32_TYPE]
+
     def create_param_read_frame(self, origin):
-        # TODO: determine if any chunks are missing or need updating
-        frame = create_param_read_frame(origin, self.num, 0)
+        if self.chunks:
+            # Determine if any chunks are missing or need updating
+            if None in self.chunks:
+                chunk = self.chunks.index(None)
+            else:
+                self.debug("error 5")
+                return None
+        else:
+            chunk = 0
+        frame = create_param_read_frame(origin, self.num, chunk)
         return frame
 
     def debug(self, txt):
@@ -587,19 +630,47 @@ class CRSFParam:
             self.debug('invalid frame type')
             return
         payload = frame.payload
-        param_num, chunks_remain, parent_folder, data_type = payload[:4]
-        hidden, data_type = data_type & 0x80, data_type & 0x7F
+        param_num, chunks_remain = payload[:2]
+
+        # Handle chunking
         if chunks_remain:
-            self.debug("error: chunks remain: " + str(frame))
+            # More chunks expected.
+            if not self.chunks:
+                # Assumption! Received first chunk
+                self.chunks = [None]*(chunks_remain + 1)
+                self.total_chunks = chunks_remain + 1
+            self.chunks[-chunks_remain - 1] = frame.payload
             return
-        if data_type == self.FOLDER_TYPE:
-            try:
-                nul = 4 + payload[4:].index(0x00)
-                name = bytes(payload[4:nul]).decode()
-            except:
-                # Invalid frame?
-                self.debug('frame error: ' + str(frame))
+        elif self.chunks:
+            # Last chunk received. Reassemble payload from chunks.
+            self.chunks[-1] = frame.payload
+            if None not in self.chunks and \
+               list(reversed([x[1] for x in self.chunks])) == list(range(len(self.chunks))) and \
+               len([1 for x in self.chunks if x[0] == self.num]) == len(self.chunks):
+                payload = self.chunks[0][:2]
+                for x in self.chunks:
+                    payload += x[2:]
+            else:
+                self.debug("error: chunks error")
                 return
+            self.chunks = []
+        else:
+            # Trivial case: no chunking.
+            # CRSF frame contains the parameter entry entirely.
+            pass
+
+        parent_folder, data_type = payload[2:4]
+        hidden, data_type = data_type & 0x80, data_type & 0x7F
+        try:
+            nul = 4 + payload[4:].index(0x00)
+            name = bytes(payload[4:nul]).decode()
+        except:
+            # Invalid frame?
+            self.debug('frame error: ' + str(frame))
+            return
+
+        # Type-specific value
+        if data_type == self.FOLDER_TYPE:
             try:
                 end = nul + 1 + payload[nul+1:].index(0xFF)
                 children = list(payload[nul+1:end])
@@ -620,13 +691,6 @@ class CRSFParam:
                 self.debug("error: folder %d: multichunk folders not supported" % param_num)
                 return
         elif data_type == self.COMMAND_TYPE:
-            try:
-                nul = 4 + payload[4:].index(0x00)
-                name = bytes(payload[4:nul]).decode()
-            except:
-                # Invalid frame?
-                self.debug('frame error: ' + str(frame))
-                return
             if chunks_remain == 0:
                 self.parent_folder = parent_folder
                 self.type = data_type
@@ -638,13 +702,6 @@ class CRSFParam:
                 self.debug("error: folder %d: multichunk folders not supported" % param_num)
                 return
         elif data_type == self.INFO_TYPE:
-            try:
-                nul = 4 + payload[4:].index(0x00)
-                name = bytes(payload[4:nul]).decode()
-            except:
-                # Invalid frame?
-                self.debug('frame error 3: ' + str(frame))
-                return
             try:
                 end = nul + 1 + payload[nul+1:].index(0x00)
                 value = bytes(payload[nul+1:end]).decode()
@@ -662,6 +719,31 @@ class CRSFParam:
             else:
                 self.debug("error: folder %d: multichunk folders not supported" % param_num)
                 return
+        elif data_type == self.TEXT_SELECTION_TYPE:
+            try:
+                end = nul + 1 + payload[nul+1:].index(0x00)
+                options = bytes(payload[nul+1:end]).decode()
+                options = options.split(';')
+            except:
+                self.debug('frame error 6: ' + str(frame))
+                return
+            value, val_min, val_max, val_def = payload[end+1:end+5]
+            # TODO: unit
+            if chunks_remain == 0:
+                self.parent_folder = parent_folder
+                self.type = data_type
+                self.name = name
+                self.hidden = hidden
+                self.value = value
+                self.options = options
+                self.min = val_min
+                self.default = val_def
+                self.max = val_max
+                self.debug("selection %d OK" % (val_max + 1))
+                self.obtained_time = time.time()
+            else:
+                self.debug("error: folder %d: multichunk folders not supported" % param_num)
+                return
         else:
             self.debug("error: data_type %d" % data_type)
             self.type = data_type
@@ -674,15 +756,16 @@ class CRSFDevice:
     POLL_PERIOD_S = 2.0
     POLL_RESPONSE_SPEED_UP_FACTOR = 0.95
     FOLDER_PERIOD_S = 10
+    PARAM_TIMEOUT_S = 120
 
     class InvalidType(ValueError):
         pass
 
     def __init__(self, frame, menu_ui, debug_cb=None):
-        self.origin = 0             # network address of this device
-        self.last_seen = 0          # when was the last time "device information" was obtained from the device?
-        self.last_read = 0          # when was the last time "param read" was sent to the device?
-        self.last_read_chunk = (0, 0)
+        self.origin = 0                 # network address of this device
+        self.last_seen = 0              # when was the last time "device information" was obtained from the device?
+        self.last_read_time = 0         # when was the last time "param read" was sent to the device?
+        self.last_read_frame = 0
 
         # Parsed from "device information" frame
         self.name = 0x00
@@ -722,10 +805,10 @@ class CRSFDevice:
         if not (0 <= folder < len(self.menu)):
             self.debug('invalid folder %s' % str(folder))
             return
-        if time.time() - self.last_read < self.POLL_PERIOD_S:
+        if time.time() - self.last_read_time < self.POLL_PERIOD_S:
             return
-        self.last_read = time.time()
-
+        self.last_read_time = time.time()
+    
         if self.menu[folder] is None:
             self.menu[folder] = CRSFParam(folder, debug_cb=self.debug_cb)
         elif self.menu[folder].obtained_time and not self.menu[folder].is_folder():
@@ -739,8 +822,13 @@ class CRSFDevice:
         elif self.menu[folder].obtained_time:
             oldest_time, oldest_child = None, None
             for child in self.menu[folder].children:
-                if self.menu[child] is None or not self.menu[child].obtained_time:
+                if self.menu[child] is None or not self.menu[child].obtained_time and \
+                   time.time() - self.menu[child].created_time > self.PARAM_TIMEOUT_S:
+                    # Create or recreate parameter to start obtaining it from beginning
                     self.menu[child] = CRSFParam(child, debug_cb=self.debug_cb)
+                    frame = self.menu[child].create_param_read_frame(self.origin)
+                    break
+                elif None in self.menu[child].chunks:
                     frame = self.menu[child].create_param_read_frame(self.origin)
                     break
                 elif oldest_time is None or time.time() - self.menu[child].obtained_time > oldest_time:
@@ -753,15 +841,15 @@ class CRSFDevice:
         if frame:
             # TODO: replace this with two callbacks: menu_id.write_crsf and menu_ui.debug
             self.menu_ui.write_crsf(frame)
-            self.last_read_chunk = (frame.payload[0], frame.payload[1])
+            self.last_read_frame = frame.payload[0]
 
     def process_frame(self, frame):
         '''Process frame from this device'''
         if frame.type == CRSF.MSG_TYPE_PARAM_ENTRY:
             # TODO: process "param entry" frame
             param_num = frame.payload[0]
-            if self.last_read_chunk == (frame.payload[0], frame.payload[1]):
-                self.last_read -= self.POLL_PERIOD_S * self.POLL_RESPONSE_SPEED_UP_FACTOR
+            if self.last_read_frame == param_num:
+                self.last_read_time -= self.POLL_PERIOD_S * self.POLL_RESPONSE_SPEED_UP_FACTOR
             if 0 <= param_num < len(self.menu):
                 if isinstance(self.menu[param_num], CRSFParam):
                     self.menu[param_num].process_frame(frame)
@@ -788,11 +876,15 @@ class CRSFMenu:
         curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_RED)
         curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(4, curses.COLOR_GREEN, curses.COLOR_WHITE)
+        curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
+        curses.init_pair(6, curses.COLOR_CYAN, curses.COLOR_BLACK)
         self.color = {
             'WHITE_BLACK': curses.color_pair(1),
             'WHITE_RED': curses.color_pair(2),
             'WHITE_BLUE': curses.color_pair(3),
             'GREEN_WHITE': curses.color_pair(4),
+            'MAGENTA_BLACK': curses.color_pair(5),
+            'CYAN_BLACK': curses.color_pair(6),
         }
 
         self.scr = stdscr
@@ -829,6 +921,8 @@ class CRSFMenu:
     def debug(self, txt):
         if txt:
             self.debug_txt = txt
+            if self.CAPTURE_LOGS:
+                self.log_file.write(txt+'\n')
 
     def write_crsf(self, frame):
         self.conn.write_crsf(frame)
@@ -883,15 +977,36 @@ class CRSFMenu:
             self.bor.addstr(2,2, "This folder is empty")
         for cnt, child in enumerate(folder.children):
             self.bor.move(2+cnt,2)
-            color = self.color['WHITE_BLUE'] if cnt == self.menu_pos else self.color['WHITE_BLACK']
-            self.bor.addstr(device.menu[child].name if device.menu[child] else '...', color)
+            sel_color = ((self.color['WHITE_BLUE'] | curses.A_BOLD) if cnt == self.menu_pos else self.color['WHITE_BLACK'])
+            key = device.menu[child].name if device.menu[child] and device.menu[child].name else '...'
+            if device.menu[child] and not device.menu[child].is_selection():
+                self.bor.addstr(key, sel_color)
+            else:
+                self.bor.addstr(key)
             if device.menu[child]:
                 if device.menu[child].is_folder():
                     self.bor.addstr(' >')
-                elif device.menu[child].is_info():
-                    self.bor.addstr(' ' + device.menu[child].value)
+                elif device.menu[child].is_info() or device.menu[child].is_selection():
+                    if key[-1] != ':':
+                        self.bor.addstr(':')
+                        key += ':'
+                    WIDTH = 17
+                    if len(key) < WIDTH:
+                        self.bor.addstr(' '*(WIDTH-len(key)))
+                    if device.menu[child].is_info():
+                        self.bor.addstr(' ' + device.menu[child].value)
+                    elif device.menu[child].is_selection():
+                        self.bor.addstr(' ')
+                        self.bor.addstr('<', sel_color)
+                        if device.menu[child].options and \
+                           0 <= device.menu[child].value < len(device.menu[child].options): 
+                            val = device.menu[child].options[device.menu[child].value]
+                        else:
+                            val = str(device.menu[child].value)
+                        self.bor.addstr(val, sel_color)
+                        self.bor.addstr('>', sel_color)
                 if device.menu[child].hidden:
-                    self.bor.addstr(' (hidden)')
+                    self.bor.addstr(' (hidden)', self.color['CYAN_BLACK'])
             self.displayed_params.append(device.menu[child])
 
     def draw_device_list(self):
