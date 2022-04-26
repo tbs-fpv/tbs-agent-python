@@ -594,6 +594,7 @@ class CRSFParam:
         self.hidden = False
         self.min = self.default = self.max = None
         self.options = []           # only for TEXT_SELECTION
+        self.max_length = None      # only for STRING_TYPE
 
         self.debug_cb = debug_cb
         self.created_time = time.time()
@@ -722,23 +723,25 @@ class CRSFParam:
             else:
                 self.debug("error: folder %d: multichunk folders not supported" % param_num)
                 return
-        elif data_type == self.INFO_TYPE:
+        elif data_type in [self.STRING_TYPE, self.INFO_TYPE]:
             try:
                 end = nul + 1 + payload[nul+1:].index(0x00)
                 value = bytes(payload[nul+1:end]).decode()
             except:
                 self.debug('frame error 4: ' + str(frame))
                 return
+            self.max_length = payload[end + 1] if data_type == self.STRING_TYPE else len(value)
             if chunks_remain == 0:
                 self.parent_folder = parent_folder
                 self.type = data_type
                 self.name = name
                 self.hidden = hidden
                 self.value = value
-                self.debug("info %d OK" % param_num)
+                self.debug("{} {} {} OK".format('info' if data_type == self.INFO_TYPE else 'string',
+                    param_num, self.max_length))
                 self.obtained_time = time.time()
             else:
-                self.debug("error: folder %d: multichunk folders not supported" % param_num)
+                self.debug("error: string/info %d: multichunk strings not supported" % param_num)
                 return
         elif data_type == self.TEXT_SELECTION_TYPE:
             try:
@@ -761,24 +764,6 @@ class CRSFParam:
                 self.default = val_def
                 self.max = val_max
                 self.debug("selection %d OK" % (val_max + 1))
-                self.obtained_time = time.time()
-            else:
-                self.debug("error: folder %d: multichunk folders not supported" % param_num)
-                return
-        elif data_type == self.STRING_TYPE:
-            try:
-                end = nul + 1 + payload[nul+1:].index(0x00)
-                value = bytes(payload[nul+1:end]).decode()
-            except:
-                self.debug('frame error 7: ' + str(frame))
-                return
-            if chunks_remain == 0:
-                self.parent_folder = parent_folder
-                self.type = data_type
-                self.name = name
-                self.hidden = hidden
-                self.value = value
-                self.debug("string OK")
                 self.obtained_time = time.time()
             else:
                 self.debug("error: folder %d: multichunk folders not supported" % param_num)
