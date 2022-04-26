@@ -8,9 +8,10 @@ It can sniff broadcast frames, receive paramters, etc.
 
 # TODO: figure out why TCP doesn't work with the "menu" option
 # TODO: implement commands
-# TODO: implement numeric input
 # TODO: introduce more command-line arguments: port, baud, host, origin
 # TODO: smarter selection options navigation
+# TODO: implement float type input
+# TODO: implement integer types (rarely used)
 
 import sys, time, functools, os, curses
 import serial, socket, queue, threading
@@ -88,6 +89,14 @@ class CRSF:
     # CRSF frame structure (field offsets)
     OFFSET_LENGTH = 1
     OFFSET_MSG_TYPE = 2
+
+    @staticmethod
+    def decode_int32(data):
+        uint32 = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3]
+        if uint32 & 0x80000000:
+            return -(~uint32) - 1
+        else:
+            return uint32
 
 # Message type -> human readable name
 msg_name = {}
@@ -582,22 +591,32 @@ class CRSFParam:
         # TODO: poll stable parameters less often
         # TODO: ensure that different chunks are from short time frame
         # TODO: detect changes in chunks, invalidate parameter if some chunk changed
-        self.obtained_time = 0      # when was this parameter last refreshed?
+
+        # Common CRSF-related attributes
         self.num = param_num
         self.parent_folder = None
-        self.total_chunks = 0
         self.type = None
         self.name = '...'
-        self.chunks = []            # CRSF frames, a list of all chunks
-        self.children = None        # children (only for a FOLDER_TYPE)
+        self.chunks = []            # payloads of all chunks
         self.value = None           # except for FOLDER_TYPE
         self.hidden = False
-        self.min = self.default = self.max = None
-        self.options = []           # only for TEXT_SELECTION
-        self.max_length = None      # only for STRING_TYPE
 
+        # Type-specific attributes
+        self.min = self.default = self.max = None       # numeric types and TEXT_SELECTION_TYPE
+        self.unit = None            # only in numeric and TEXT_SELECTION_TYPE
+        self.children = None        # only for FOLDER_TYPE
+        self.options = []           # only for TEXT_SELECTION_TYPE
+        self.max_length = None      # only for STRING_TYPE
+        self.decimal_point = None   # only for FLOAT_TYPE
+        self.step_size = None       # only for FLOAT_TYPE
+        self.status = None          # only for COMMAND_TYPE
+        self.timeout = None         # only for COMMAND_TYPE
+        self.info = None            # only for COMMAND_TYPE
+
+        # Additional attributes
         self.debug_cb = debug_cb
         self.created_time = time.time()
+        self.obtained_time = 0      # when was this parameter last refreshed?
 
     def is_folder(self):
         return self.type == self.FOLDER_TYPE
@@ -613,6 +632,9 @@ class CRSFParam:
 
     def is_command(self):
         return self.type == self.COMMAND_TYPE
+
+    def is_float(self):
+        return self.type == self.FLOAT_TYPE
 
     def is_number_input(self):
         return self.type in [self.FLOAT_TYPE,
@@ -642,6 +664,15 @@ class CRSFParam:
         else:
             self.debug('error: value is None')
 
+    def render_float(self, val=None):
+        if val is None:
+            val = self.value
+        if self.type == self.FLOAT_TYPE:
+            dec = ('0.' + '0'*self.decimal_point + '1') if self.decimal_point else '1'
+            return val * eval(dec)
+        else:
+            raise ValueError("not float")
+
     def debug(self, txt):
         if self.debug_cb:
             self.debug_cb(txt)
@@ -660,7 +691,6 @@ class CRSFParam:
             if not self.chunks:
                 # Assumption! Received first chunk
                 self.chunks = [None]*(chunks_remain + 1)
-                self.total_chunks = chunks_remain + 1
             self.chunks[-chunks_remain - 1] = frame.payload
             return
         elif self.chunks:
@@ -713,6 +743,7 @@ class CRSFParam:
                 self.debug("error: folder %d: multichunk folders not supported" % param_num)
                 return
         elif data_type == self.COMMAND_TYPE:
+            # TODO
             if chunks_remain == 0:
                 self.parent_folder = parent_folder
                 self.type = data_type
@@ -722,6 +753,30 @@ class CRSFParam:
                 self.obtained_time = time.time()
             else:
                 self.debug("error: folder %d: multichunk folders not supported" % param_num)
+                return
+        elif data_type == self.FLOAT_TYPE:
+            try:
+                end = nul + 22 + payload[nul+22:].index(0x00)
+                unit = bytes(payload[nul+22:end]).decode()
+            except:
+                self.debug('frame error 5: ' + str(frame))
+                return
+            if chunks_remain == 0:
+                self.parent_folder = parent_folder
+                self.type = data_type
+                self.hidden = hidden
+                self.name = name
+                self.value = CRSF.decode_int32(payload[nul+1:nul+5])
+                self.min = CRSF.decode_int32(payload[nul+5:nul+9])
+                self.max = CRSF.decode_int32(payload[nul+9:nul+13])
+                self.default = CRSF.decode_int32(payload[nul+13:nul+17])
+                self.decimal_point = payload[nul+17]
+                self.step_size = CRSF.decode_int32(payload[nul+18:nul+22])
+                self.unit = unit
+                self.debug("float {} = {}, {}, {} OK".format(param_num, self.value, self.max, self.unit))
+                self.obtained_time = time.time()
+            else:
+                self.debug("error: float %d: multichunk floats not supported" % param_num)
                 return
         elif data_type in [self.STRING_TYPE, self.INFO_TYPE]:
             try:
@@ -907,6 +962,7 @@ class CRSFMenu:
         curses.init_pair(4, curses.COLOR_GREEN, curses.COLOR_WHITE)
         curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
         curses.init_pair(6, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_CYAN)
         self.color = {
             'WHITE_BLACK': curses.color_pair(1),
             'WHITE_RED': curses.color_pair(2),
@@ -914,6 +970,7 @@ class CRSFMenu:
             'GREEN_WHITE': curses.color_pair(4),
             'MAGENTA_BLACK': curses.color_pair(5),
             'CYAN_BLACK': curses.color_pair(6),
+            'BLACK_CYAN': curses.color_pair(7),
         }
 
         self.scr = stdscr
@@ -997,12 +1054,28 @@ class CRSFMenu:
 
         self.sub_win.move(0,0)
         if self.dialog_param.is_string_input():
-            self.sub_win.addstr('Input string: ')
+            self.sub_win.addstr('Input string:')
             self.sub_win.move(1,0)
             val = (self.dialog_val + ' '*w)[:w-1]
             self.sub_win.addstr(val, curses.A_REVERSE)
             self.sub_win.move(2,0)
-            self.sub_win.addstr("NOTE: Input with keyboard may be buggy")
+            self.sub_win.addstr("NOTE: Input with keyboard may be buggy", self.color['WHITE_RED'])
+        elif self.dialog_param.is_float():
+            is_integer = self.dialog_param.decimal_point == 0
+            self.sub_win.addstr('Input {}number:'.format('' if is_integer else 'float '))
+            self.sub_win.move(1,0)
+            val = self.dialog_param.render_float()
+            val = (str(val) + ' '*w)[:w-1]
+            self.sub_win.addstr(val, curses.A_REVERSE)
+            self.sub_win.move(2,0)
+            range_min = self.dialog_param.render_float(self.dialog_param.min)
+            range_max = self.dialog_param.render_float(self.dialog_param.max)
+            self.sub_win.addstr('Range: {}..{}'.format(range_min, range_max))
+            self.sub_win.move(3,0)
+            step = self.dialog_param.render_float(self.dialog_param.step_size)
+            self.sub_win.addstr('Step size: {}'.format(step))
+            self.sub_win.move(4,0)
+            self.sub_win.addstr('NOTE: Input not implemented', self.color['WHITE_RED'])
         elif self.dialog_param.is_selection():
             if self.dialog_pos < 0:
                 self.dialog_pos = len(self.dialog_param.options) - 1
@@ -1061,7 +1134,8 @@ class CRSFMenu:
             self.bor.move(2+cnt,2)
             sel_color = ((self.color['WHITE_BLUE'] | curses.A_BOLD) if cnt == self.menu_pos else self.color['WHITE_BLACK'])
             key = device.menu[child].name if device.menu[child] and device.menu[child].name else '...'
-            if device.menu[child] and not device.menu[child].is_selection() and not device.menu[child].is_string_input():
+            if device.menu[child] and not device.menu[child].is_selection() and \
+               not device.menu[child].is_string_input() and not device.menu[child].is_float():
                 self.bor.addstr(key, sel_color)
             else:
                 self.bor.addstr(key)
@@ -1069,7 +1143,7 @@ class CRSFMenu:
                 if device.menu[child].is_folder():
                     self.bor.addstr(' >')
                 elif device.menu[child].is_info() or device.menu[child].is_selection() or \
-                     device.menu[child].is_string_input():
+                     device.menu[child].is_string_input() or device.menu[child].is_float():
                     if key[-1] != ':':
                         self.bor.addstr(':')
                         key += ':'
@@ -1078,10 +1152,16 @@ class CRSFMenu:
                         self.bor.addstr(' '*(WIDTH-len(key)))
                     if device.menu[child].is_info():
                         self.bor.addstr(' ' + device.menu[child].value)
-                    elif device.menu[child].is_string_input():
-                        flags = (self.color['WHITE_RED'] | curses.A_BOLD) if cnt == self.menu_pos else curses.A_REVERSE
+                    elif device.menu[child].is_string_input() or device.menu[child].is_float():
+                        sel_col = (self.color['WHITE_RED'] | curses.A_BOLD) if device.menu[child].is_string_input() else \
+                                  self.color['BLACK_CYAN']
+                        flags = sel_col if cnt == self.menu_pos else curses.A_REVERSE
                         self.bor.addstr(' ')
-                        self.bor.addstr(device.menu[child].value, flags)
+                        if device.menu[child].is_string_input():
+                            val = device.menu[child].value
+                        else:
+                            val = str(device.menu[child].render_float())
+                        self.bor.addstr(val, flags)
                     elif device.menu[child].is_selection():
                         self.bor.addstr(' ')
                         self.bor.addstr('<', sel_color)
@@ -1273,7 +1353,8 @@ class CRSFMenu:
                         else:
                             val = None
                         write_frame = self.dialog_param.create_write_frame(self.menu_device.origin, val)
-                        self.write_crsf(write_frame)
+                        if write_frame:
+                            self.write_crsf(write_frame)
                 elif self.dialog_param and self.dialog_param.is_string_input():
                     self.dialog_val += key
                 else:
