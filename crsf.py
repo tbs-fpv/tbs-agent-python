@@ -7,11 +7,12 @@ It can sniff broadcast frames, receive paramters, etc.
 '''
 
 # TODO: figure out why TCP doesn't work with the "menu" option
-# TODO: implement commands
 # TODO: introduce more command-line arguments: port, baud, host, origin
-# TODO: smarter selection options navigation
-# TODO: implement float type input
-# TODO: implement integer types (rarely used)
+# TODO: smarter "text selection" options navigation
+# TODO: implement input for "float" type
+# TODO: implement integer types (these are rarely used)
+# TODO: implement command polling and resends
+# TODO: implement CRSFv3
 
 import sys, time, functools, os, curses
 import serial, socket, queue, threading
@@ -30,10 +31,27 @@ TICK_SPEED = 20      # Ticks per microsecond (for LOG frames)
 SHORT_HIST_SIZE = 451   # 90 s
 HIST_SIZE = 10*SHORT_HIST_SIZE
 
-# Text coloring logic
-GREEN, RED = 2, 160     # colors
-fg = lambda text, color: "\33[38;5;" + str(color) + "m" + text + "\33[0m"
-bg = lambda text, color: "\33[48;5;" + str(color) + "m" + text + "\33[0m"
+class Terminal:
+    GREEN, RED = 2, 160     # Unix terminal colors
+
+    @staticmethod
+    def fg(text, color):
+        '''
+        Adds foreground color for Unix terminals.
+        Leaves text without change on Windows.
+        '''
+        if sys.platform.startswith('win'):
+            return text
+        else:
+            return "\33[38;5;" + str(color) + "m" + text + "\33[0m"
+
+    @staticmethod
+    def green(text):
+        return Terminal.fg(text, Terminal.GREEN)
+
+    @staticmethod
+    def red(text):
+        return Terminal.fg(text, Terminal.RED)
 
 class CRSF:
 
@@ -89,6 +107,15 @@ class CRSF:
     # CRSF frame structure (field offsets)
     OFFSET_LENGTH = 1
     OFFSET_MSG_TYPE = 2
+
+    # Menu
+    MENU_COMMAND_READY = 0                  # --> feedback
+    MENU_COMMAND_START = 1                  # <-- input
+    MENU_COMMAND_PROGRESS = 2               # --> feedback
+    MENU_COMMAND_CONFIRMATION_NEEDED = 3    # --> feedback
+    MENU_COMMAND_CONFIRM = 4                # <-- input
+    MENU_COMMAND_CANCEL = 5                 # <-- input
+    MENU_COMMAND_POLL = 6                   # <-- input
 
     @staticmethod
     def decode_int32(data):
@@ -294,7 +321,7 @@ def link_stats_decode(data):
         def get_hist_lqi(lqi_hist):
             avg = sum([x[1] for x in lqi_hist])/len(lqi_hist)
             return '{}/{:.1f}'.format(
-                fg('100', GREEN) if avg == 100 else fg('{:.2f}'.format(avg), RED),
+                Terminal.green('100') if avg == 100 else Terminal.red('{:.2f}'.format(avg)),
                 (lqi_hist[-1][0] - lqi_hist[0][0])
             )
         short_up = get_hist_lqi(up_lqi_history[-SHORT_HIST_SIZE:])
@@ -743,12 +770,20 @@ class CRSFParam:
                 self.debug("error: folder %d: multichunk folders not supported" % param_num)
                 return
         elif data_type == self.COMMAND_TYPE:
-            # TODO
+            try:
+                end = nul + 3 + payload[nul+3:].index(0x00)
+                info = bytes(payload[nul+3:end]).decode()
+            except:
+                self.debug('frame error 7: ' + str(frame))
+                return
             if chunks_remain == 0:
                 self.parent_folder = parent_folder
                 self.type = data_type
                 self.name = name
                 self.hidden = hidden
+                self.status = payload[nul + 1]
+                self.timeout = payload[nul + 2]*0.1 if payload[nul + 2] % 10 else payload[nul + 2]//10
+                self.info = info
                 self.debug("command %d OK" % param_num)
                 self.obtained_time = time.time()
             else:
@@ -1043,6 +1078,8 @@ class CRSFMenu:
         self.sub_bor.move(0, 2)
         if self.dialog_param.is_selection():
             title = 'Select "' + self.dialog_param.name + '":'
+        elif self.dialog_param.is_command():
+            title = 'Command "' + self.dialog_param.name + '":'
         else:
             title = self.dialog_param.name
         self.sub_bor.addstr(title, curses.A_REVERSE)
@@ -1075,6 +1112,8 @@ class CRSFMenu:
             step = self.dialog_param.render_float(self.dialog_param.step_size)
             self.sub_win.addstr('Step size: {}'.format(step))
             self.sub_win.move(4,0)
+            self.sub_win.addstr('Unit: {}'.format(self.dialog_param.unit))
+            self.sub_win.move(5,0)
             self.sub_win.addstr('NOTE: Input not implemented', self.color['WHITE_RED'])
         elif self.dialog_param.is_selection():
             if self.dialog_pos < 0:
@@ -1093,7 +1132,37 @@ class CRSFMenu:
             self.sub_win.addstr('Input value: ')
             self.sub_win.addstr('Not implemented', self.color['WHITE_RED'])
         elif self.dialog_param.is_command():
-            self.sub_win.addstr('Command. Not implemented', self.color['WHITE_RED'])
+            if self.dialog_pos < 0:
+                self.dialog_pos = 1 if self.dialog_param.status == CRSF.MENU_COMMAND_CONFIRMATION_NEEDED else 0
+            elif self.dialog_pos > 1 or self.dialog_param.status != CRSF.MENU_COMMAND_CONFIRMATION_NEEDED:
+                self.dialog_pos = 0
+            status = 'START command sent.'
+            if self.dialog_param.status == CRSF.MENU_COMMAND_CONFIRMATION_NEEDED:
+                status = 'Please, confirm:'
+            self.sub_win.addstr(status)
+            self.sub_win.move(1,0)
+            info = (str(self.dialog_param.info) + ' '*w)[:w-1]
+            self.sub_win.addstr(info, curses.A_REVERSE)
+
+            # Show options:
+            self.sub_win.move(2,1)
+            sel_color = (self.color['WHITE_BLUE'] | curses.A_BOLD)
+            # - "Cancel" button
+            cancel_quit = 'Quit' if self.dialog_param.status == CRSF.MENU_COMMAND_READY else 'Cancel'
+            self.sub_win.addstr(cancel_quit, sel_color if self.dialog_pos == 0 else self.color['WHITE_BLACK'])
+            # - "Confirm" button
+            if self.dialog_param.status == CRSF.MENU_COMMAND_CONFIRMATION_NEEDED:
+                self.sub_win.addstr(' / ')
+                self.sub_win.addstr('Confirm', sel_color if self.dialog_pos == 1 else self.color['WHITE_BLACK'])
+
+            # Show state
+            self.sub_win.move(4,0)
+            status = {
+                CRSF.MENU_COMMAND_READY: 'Ready',
+                CRSF.MENU_COMMAND_CONFIRMATION_NEEDED: 'Pending',
+                CRSF.MENU_COMMAND_PROGRESS: 'In progress'}.get(self.dialog_param.status, self.dialog_param.status)
+            self.sub_win.addstr('Status: {}. Timeout: {} s'.format(status, self.dialog_param.timeout))
+
  
     def draw_device_menu(self):
         device = self.menu_device
@@ -1342,19 +1411,47 @@ class CRSFMenu:
                                 self.dialog_param = self.displayed_params[self.menu_pos]
                                 self.dialog_pos = 0
                                 self.dialog_val = str(self.displayed_params[self.menu_pos].value)
+
+                                # If command -> send START
+                                if self.displayed_params[self.menu_pos].is_command():
+                                    write_frame = self.dialog_param.create_write_frame(
+                                        self.menu_device.origin, 
+                                        bytearray([CRSF.MENU_COMMAND_START])
+                                    )
+                                    if write_frame:
+                                        self.write_crsf(write_frame)
                         else:
                             self.debug("error: menu_pos")
                     else:
+                        # Dialog window open ->
                         # Set parameter to the currently selected value
                         if self.dialog_param.is_string_input():
                             val = bytearray(self.dialog_val.encode()) + bytearray(b'\x00')
+                        elif self.dialog_param.is_command():
+                            quit_cancel = self.dialog_pos == 0
+                            just_quit = (quit_cancel and \
+                                    self.dialog_param.status == CRSF.MENU_COMMAND_CONFIRMATION_NEEDED)
+                            send_cancel = (quit_cancel and \
+                                    self.dialog_param.status != CRSF.MENU_COMMAND_READY)
+                            send_confirm = (not quit_cancel and \
+                                    self.dialog_param.status == CRSF.MENU_COMMAND_CONFIRMATION_NEEDED)
+                            if just_quit or quit_cancel and not send_cancel:
+                                self.debug("quit")
+                                self.dialog_param = None 
+                            elif send_confirm:
+                                self.debug("confirm")
+                                val = [CRSF.MENU_COMMAND_CONFIRM]
+                            elif send_cancel:
+                                self.debug("cancel")
+                                val = [CRSF.MENU_COMMAND_CANCEL]
                         elif self.dialog_param.is_selection():
                             val = [self.dialog_pos]
                         else:
                             val = None
-                        write_frame = self.dialog_param.create_write_frame(self.menu_device.origin, val)
-                        if write_frame:
-                            self.write_crsf(write_frame)
+                        if self.dialog_param:
+                            write_frame = self.dialog_param.create_write_frame(self.menu_device.origin, val)
+                            if write_frame:
+                                self.write_crsf(write_frame)
                 elif self.dialog_param and self.dialog_param.is_string_input():
                     self.dialog_val += key
                 else:
