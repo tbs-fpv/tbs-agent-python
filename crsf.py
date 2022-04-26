@@ -4,12 +4,13 @@
 CRSF client in Python. Works via TCP or UART connections.
 Can be used to connect to WiFi module on Crossfire.
 It can sniff broadcast frames, receive paramters, etc.
+
+For navigating inside the CRSF menu use keys: UP, DOWN, Q, ENTER, BACKSPACE.
 '''
 
 # TODO: figure out why TCP doesn't work with the "menu" option
 # TODO: introduce more command-line arguments: port, baud, host, origin
 # TODO: smarter "text selection" options navigation
-# TODO: implement input for "float" type
 # TODO: implement integer types (these are rarely used)
 # TODO: implement command polling and resends
 # TODO: implement CRSFv3
@@ -124,6 +125,15 @@ class CRSF:
             return -(~uint32) - 1
         else:
             return uint32
+
+    @staticmethod
+    def encode_int32(val):
+        return [
+            (val >> 24) & 0xFF,
+            (val >> 16) & 0xFF,
+            (val >>  8) & 0xFF,
+             val        & 0xFF,
+        ]
 
 # Message type -> human readable name
 msg_name = {}
@@ -691,14 +701,25 @@ class CRSFParam:
         else:
             self.debug('error: value is None')
 
+    def get_float_decimal(self):
+        return eval(('0.' + '0'*self.decimal_point + '1') if self.decimal_point else '1')
+
     def render_float(self, val=None):
+        '''Convert integer int32 to float based on self.decimal_point'''
         if val is None:
             val = self.value
         if self.type == self.FLOAT_TYPE:
-            dec = ('0.' + '0'*self.decimal_point + '1') if self.decimal_point else '1'
-            return val * eval(dec)
+            return val * self.get_float_decimal()
         else:
             raise ValueError("not float")
+
+    def encode_float(self, val):
+        '''Convert float to int32 based on self.decimal_point'''
+        val = int(round(val / self.get_float_decimal()))
+        if val < self.min or val > self.max:
+            self.debug("error: {} out of range {}..{}".format(val, self.min, self.max))
+            return None
+        return val
 
     def debug(self, txt):
         if self.debug_cb:
@@ -1101,8 +1122,7 @@ class CRSFMenu:
             is_integer = self.dialog_param.decimal_point == 0
             self.sub_win.addstr('Input {}number:'.format('' if is_integer else 'float '))
             self.sub_win.move(1,0)
-            val = self.dialog_param.render_float()
-            val = (str(val) + ' '*w)[:w-1]
+            val = (self.dialog_val + ' '*w)[:w-1]
             self.sub_win.addstr(val, curses.A_REVERSE)
             self.sub_win.move(2,0)
             range_min = self.dialog_param.render_float(self.dialog_param.min)
@@ -1112,9 +1132,7 @@ class CRSFMenu:
             step = self.dialog_param.render_float(self.dialog_param.step_size)
             self.sub_win.addstr('Step size: {}'.format(step))
             self.sub_win.move(4,0)
-            self.sub_win.addstr('Unit: {}'.format(self.dialog_param.unit))
-            self.sub_win.move(5,0)
-            self.sub_win.addstr('NOTE: Input not implemented', self.color['WHITE_RED'])
+            self.sub_win.addstr('Unit: {}'.format(self.dialog_param.unit or '--'))
         elif self.dialog_param.is_selection():
             if self.dialog_pos < 0:
                 self.dialog_pos = len(self.dialog_param.options) - 1
@@ -1306,7 +1324,7 @@ class CRSFMenu:
 
         # Draw debug info
         if self.debug_txt is not None:
-            self.draw_debug('Debug: ' + self.debug_txt)
+            self.draw_debug('Debug: ' + str(self.debug_txt))
         self.bor.addstr(curses.LINES - 4,1, self.last_key)
         if self.last_frame:
             self.bor.addstr(curses.LINES - 3,1, str(self.last_frame))
@@ -1389,7 +1407,8 @@ class CRSFMenu:
                     else:
                         self.menu_pos += 1
                 elif key == self.BACKSPACE_KEY:
-                    if self.dialog_param and self.dialog_param.is_string_input():
+                    if self.dialog_param and \
+                       (self.dialog_param.is_string_input() or self.dialog_param.is_float()):
                         self.dialog_val = ''
                 elif key == self.ENTER_KEY:
                     if self.menu_device is None:
@@ -1410,7 +1429,10 @@ class CRSFMenu:
                             elif self.displayed_params[self.menu_pos].is_input():
                                 self.dialog_param = self.displayed_params[self.menu_pos]
                                 self.dialog_pos = 0
-                                self.dialog_val = str(self.displayed_params[self.menu_pos].value)
+                                if self.dialog_param.is_float():
+                                    self.dialog_val = str(self.dialog_param.render_float())
+                                else:
+                                    self.dialog_val = str(self.displayed_params[self.menu_pos].value)
 
                                 # If command -> send START
                                 if self.displayed_params[self.menu_pos].is_command():
@@ -1424,9 +1446,18 @@ class CRSFMenu:
                             self.debug("error: menu_pos")
                     else:
                         # Dialog window open ->
-                        # Set parameter to the currently selected value
+                        #   Set parameter to the currently selected value
                         if self.dialog_param.is_string_input():
                             val = bytearray(self.dialog_val.encode()) + bytearray(b'\x00')
+                        elif self.dialog_param.is_float():
+                            try:
+                                val = float(self.dialog_val)
+                            except:
+                                val = None
+                            if val is not None:
+                                val = self.dialog_param.encode_float(val)
+                                if val is not None:
+                                    val = CRSF.encode_int32(val)
                         elif self.dialog_param.is_command():
                             quit_cancel = self.dialog_pos == 0
                             just_quit = (quit_cancel and \
@@ -1452,7 +1483,8 @@ class CRSFMenu:
                             write_frame = self.dialog_param.create_write_frame(self.menu_device.origin, val)
                             if write_frame:
                                 self.write_crsf(write_frame)
-                elif self.dialog_param and self.dialog_param.is_string_input():
+                elif self.dialog_param and \
+                     (self.dialog_param.is_string_input() or self.dialog_param.is_float()):
                     self.dialog_val += key
                 else:
                     self.debug("unknown key pressed: " + str(key) + '/' + repr(key))
