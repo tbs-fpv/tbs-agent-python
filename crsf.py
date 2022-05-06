@@ -1016,7 +1016,7 @@ class CRSFMenu:
         curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_RED)
         curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(4, curses.COLOR_GREEN, curses.COLOR_WHITE)
-        curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
+        curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE)
         curses.init_pair(6, curses.COLOR_CYAN, curses.COLOR_BLACK)
         curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_CYAN)
         self.color = {
@@ -1024,7 +1024,7 @@ class CRSFMenu:
             'WHITE_RED': curses.color_pair(2),
             'WHITE_BLUE': curses.color_pair(3),
             'GREEN_WHITE': curses.color_pair(4),
-            'MAGENTA_BLACK': curses.color_pair(5),
+            'BLACK_WHITE': curses.color_pair(5),
             'CYAN_BLACK': curses.color_pair(6),
             'BLACK_CYAN': curses.color_pair(7),
         }
@@ -1219,13 +1219,23 @@ class CRSFMenu:
             self.bor.addstr(2,2, "This folder is empty")
         for cnt, child in enumerate(folder.children):
             self.bor.move(2+cnt,2)
-            sel_color = ((self.color['WHITE_BLUE'] | curses.A_BOLD) if cnt == self.menu_pos else self.color['WHITE_BLACK'])
+            is_cur = (cnt == self.menu_pos)
+            active_color = (self.color['WHITE_BLUE'] | curses.A_BOLD)
+            inactive_color = self.color['BLACK_WHITE']
+            sel_color = (active_color if is_cur else self.color['WHITE_BLACK'])
+
+            # Draw "key" (name of the field)
             key = device.menu[child].name if device.menu[child] and device.menu[child].name else '...'
-            if device.menu[child] and not device.menu[child].is_selection() and \
-               not device.menu[child].is_string_input() and not device.menu[child].is_float():
-                self.bor.addstr(key, sel_color)
-            else:
+            do_not_color_key = device.menu[child] and (device.menu[child].is_selection() or \
+                    device.menu[child].is_string_input() or device.menu[child].is_float())
+            if not is_cur or do_not_color_key:
                 self.bor.addstr(key)
+            else:
+                is_inactive = device.menu[child] and device.menu[child].is_info()
+                key_color = inactive_color if is_inactive else active_color
+                self.bor.addstr(key, key_color)
+
+            # Draw "value"
             if device.menu[child]:
                 if device.menu[child].is_folder():
                     self.bor.addstr(' >')
@@ -1298,7 +1308,7 @@ class CRSFMenu:
         '''Encapsulates menu drawing logic'''
 
         # Remove devices not seen for a long time
-        for addr, device in self.devices.items():
+        for addr, device in list(self.devices.items()):
             if time.time() - device.last_seen >= self.IDLE_TIMEOUT_S:
                 del(self.devices[addr])
 
@@ -1420,7 +1430,7 @@ class CRSFMenu:
                             self.menu_pos = 0
                     elif self.dialog_param is None:
                         # Navigate the device menu
-                        if 0 <= self.menu_pos < len(self.displayed_params):
+                        if 0 <= self.menu_pos < len(self.displayed_params) and self.displayed_params[self.menu_pos]:
                             if self.displayed_params[self.menu_pos].is_folder():
                                 # Change folder in the device
                                 self.menu_folder = self.displayed_params[self.menu_pos].num
@@ -1442,8 +1452,10 @@ class CRSFMenu:
                                     )
                                     if write_frame:
                                         self.write_crsf(write_frame)
-                        else:
+                        elif self.displayed_params[self.menu_pos]:
                             self.debug("error: menu_pos")
+                        else:
+                            self.debug("error: not loaded yet")
                     else:
                         # Dialog window open ->
                         #   Set parameter to the currently selected value
