@@ -10,7 +10,6 @@ For navigating inside the CRSF menu use keys: UP, DOWN, Q, ENTER, BACKSPACE.
 
 # TODO: figure out why TCP doesn't work with the "menu" option
 # TODO: introduce more command-line arguments: port, baud, host, origin
-# TODO: smarter "text selection" options navigation
 # TODO: implement integer types (these are rarely used)
 # TODO: implement command polling and resends
 # TODO: implement CRSFv3
@@ -31,6 +30,8 @@ TICK_SPEED = 20      # Ticks per microsecond (for LOG frames)
 
 SHORT_HIST_SIZE = 451   # 90 s
 HIST_SIZE = 10*SHORT_HIST_SIZE
+
+COLORIZE = not sys.platform.startswith('win')
 
 class Terminal:
     GREEN, RED = 2, 160     # Unix terminal colors
@@ -314,7 +315,7 @@ def ppm_channels_decode(data):
     return list(map(ticks_to_us, ticks))
 
 up_lqi_history, down_lqi_history = [], []
-def link_stats_decode(data):
+def explain_link_stats(data, colorize=True):
     global up_lqi_history, down_lqi_history
     cur_time = time.time()
     up_lqi_history.append((cur_time, data[2]))
@@ -330,8 +331,12 @@ def link_stats_decode(data):
     if len(up_lqi_history) > 1 and len(down_lqi_history) > 1:
         def get_hist_lqi(lqi_hist):
             avg = sum([x[1] for x in lqi_hist])/len(lqi_hist)
+            if colorize:
+                green, red = Terminal.green, Terminal.red
+            else:
+                green = red = lambda x: x
             return '{}/{:.1f}'.format(
-                Terminal.green('100') if avg == 100 else Terminal.red('{:.2f}'.format(avg)),
+                green('100') if avg == 100 else red('{:.2f}'.format(avg)),
                 (lqi_hist[-1][0] - lqi_hist[0][0])
             )
         short_up = get_hist_lqi(up_lqi_history[-SHORT_HIST_SIZE:])
@@ -343,22 +348,14 @@ def link_stats_decode(data):
 
 ppm_times = []
 last_time = 0
-def crsf_log_frame(header, frame):
-    '''Print CRSF frame in a partially parsed way'''
-
+def explain_frame(frame, colorize=True):
+    '''
+    Return text with some explanation/analysis of some types of CRSF frames
+    or empty string.
+    '''
     global last_time, ppm_times
-    s = str(header) + ': '
+    s = ''
     data = frame.bytes
-    s += 'SYNC ' if data[0] == CRSF.SYNC else ('%02x ' % data[0])
-    s += 'L=%d ' % frame.len
-    s += ('(%s) ' % msg_name[frame.type]) if frame.type in msg_name else ('(t=%02x) ' % frame.type)
-    i = 3
-    if frame.is_extended:
-        s += '%s->%s ' % (dev_name.get(data[i+1], '%02x' % data[i+1]),
-                         dev_name.get(data[i  ], '%02x' % data[i  ]))
-        i += 2
-    s += ' '.join(map(lambda x: "%02x" % x, data[i:]))
-
     # Parse certain kinds of frames
     if frame.type == CRSF.MSG_TYPE_PPM:
         channels = ppm_channels_decode(frame.payload)
@@ -372,13 +369,15 @@ def crsf_log_frame(header, frame):
     elif frame.type == CRSF.MSG_TYPE_PPM3:
         s += '\n  CRSFv3'
     elif frame.type == CRSF.MSG_TYPE_LINK_STATS:
-        s += '\n    ' + link_stats_decode(frame.payload)
+        s += '\n    ' + explain_link_stats(frame.payload, colorize)
     elif frame.type == CRSF.MSG_TYPE_DEVICE_INFO:
         device_name, sn, hw_id, fw_id, param_count, version = frame.parse()
         s += '\n  Device: {name}, S/N=0x{sn:x} HW_ID=0x{hw_id:x}, SW_ID=0x{sw_id:x}, param count={cnt}, v={v}'.format(
                         sn=sn, name=device_name, hw_id=hw_id, sw_id=fw_id, cnt=param_count, v=version)
     elif frame.type == CRSF.MSG_TYPE_PARAM_ENTRY:
-        if data[i+3] == CRSF.PARAM_TYPE_INFO:
+        i = 5  # payload start
+        if data[i+3:i+4] == [CRSF.PARAM_TYPE_INFO]:
+            # "Info" parameter (unmodifiable string)
             name = data[i+4:]
             delim = name.index(0x00)
             name, val = name[:delim], data[i+4+delim+1:]
@@ -393,8 +392,13 @@ def crsf_log_frame(header, frame):
             val = data[9:-2].decode()
         else:
             val = ' '.join(map(lambda x: "%02x" % x, data[9:-1]))
-        s += '\n  {ticks} ({ms} ms): {val}'.format(ticks=tm, ms=tm//(TICK_SPEED*1000), val=val)
-        
+        s += '\n    tick {ticks} ({ms} ms): {val}'.format(ticks=tm, ms=tm//(TICK_SPEED*1000), val=val)
+    return s
+
+def crsf_log_frame(header, frame):
+    '''Print CRSF frame in a partially parsed way'''
+    s  = str(header) + ': ' + str(frame)
+    s += explain_frame(frame, COLORIZE)
     print(s)
 
 def create_frame(data):
@@ -942,7 +946,7 @@ class CRSFDevice:
     def poll_params(self, conn, folder):
         '''Periodically send out "param read" frames for the parameters in current folder'''
         if not (0 <= folder < len(self.menu)):
-            self.debug('invalid folder %s' % str(folder))
+            self.debug('invalid folder: not 0<=%s<%d' % (str(folder), len(self.menu)))
             return
         if time.time() - self.last_read_time < self.POLL_PERIOD_S:
             return
@@ -1066,6 +1070,7 @@ class CRSFMenu:
         # - State for "dialogue" window
         self.dialog_param = None
         self.dialog_pos = 0
+        self.dialog_start_pos = 0
         self.dialog_val = ''                # string/number input
 
         if self.CAPTURE_LOGS:
@@ -1138,13 +1143,20 @@ class CRSFMenu:
                 self.dialog_pos = len(self.dialog_param.options) - 1
             elif self.dialog_pos >= len(self.dialog_param.options):
                 self.dialog_pos = 0
+
+            # Adjust start_pos
+            if self.dialog_pos < self.dialog_start_pos:
+                self.dialog_start_pos = self.dialog_pos
+            if self.dialog_pos >= self.dialog_start_pos + h:
+                self.dialog_start_pos += self.dialog_pos - (self.dialog_start_pos + h) + 1
+
             for cnt, opt in enumerate(self.dialog_param.options):
-                if cnt < h:
+                if self.dialog_start_pos <= cnt < self.dialog_start_pos + h:
                     if cnt == self.dialog_pos:
                         sel_color = (self.color['WHITE_BLUE'] | curses.A_BOLD)
                     else:
                         sel_color = self.color['WHITE_BLACK']
-                    self.sub_win.move(cnt,0)
+                    self.sub_win.move(cnt - self.dialog_start_pos, 0)
                     self.sub_win.addstr(opt, sel_color)
         elif self.dialog_param.is_number_input():
             self.sub_win.addstr('Input value: ')
@@ -1197,7 +1209,10 @@ class CRSFMenu:
            not device.menu[self.menu_folder].is_folder():
             self.menu_folder = 0
         if not device.menu[self.menu_folder] or not device.menu[self.menu_folder].is_folder():
-            self.debug("invalid folder {}".format(self.menu_folder))
+            if not device.menu[self.menu_folder]:
+                self.debug("null folder {}".format(self.menu_folder))
+            elif not device.menu[self.menu_folder].is_folder():
+                self.debug("not folder {}, type = {}".format(self.menu_folder, device.menu[self.menu_folder].type))
             return
         folder = device.menu[self.menu_folder]
 
@@ -1355,7 +1370,7 @@ class CRSFMenu:
                 try:
                     frame = self.conn.read_crsf()
                     if frame and self.CAPTURE_LOGS:
-                        self.log_file.write('> ' + str(frame) + '\n')
+                        self.log_file.write('> ' + str(frame) + explain_frame(frame, False) + '\n' )
                 except Exception as e:
                     #print("err", e)
                     break
@@ -1439,6 +1454,7 @@ class CRSFMenu:
                             elif self.displayed_params[self.menu_pos].is_input():
                                 self.dialog_param = self.displayed_params[self.menu_pos]
                                 self.dialog_pos = 0
+                                self.dialog_start_pos = 0
                                 if self.dialog_param.is_float():
                                     self.dialog_val = str(self.dialog_param.render_float())
                                 else:
