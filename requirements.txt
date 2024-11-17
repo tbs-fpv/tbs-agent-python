@@ -1,5 +1,5 @@
 # Common dependencies
-serial
+pyserial
 
 # Platform-specific dependencies #
 # window
