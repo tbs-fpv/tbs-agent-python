@@ -1,0 +1,6 @@
+# Common dependencies
+serial
+
+# Platform-specific dependencies #
+# window
+windows-curses; sys_platform == "win32"
